@@ -29,6 +29,28 @@ import type {
 } from "./types";
 import { slugify } from "./utils";
 
+// Firestore does NOT allow `undefined` values anywhere in the object.
+// This helper recursively removes keys with `undefined`.
+function stripUndefinedDeep<T>(value: T): T {
+  if (value === undefined) return undefined as unknown as T;
+  if (value === null) return value;
+  if (Array.isArray(value)) {
+    // keep array order; strip undefined elements
+    return value.filter((v) => v !== undefined).map((v) => stripUndefinedDeep(v)) as unknown as T;
+  }
+  if (typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v === undefined) continue;
+      const vv = stripUndefinedDeep(v);
+      if (vv === undefined) continue;
+      out[k] = vv;
+    }
+    return out as unknown as T;
+  }
+  return value;
+}
+
 function stripRef(prefix: string, val: string) {
   return val.startsWith(prefix) ? val.slice(prefix.length) : val;
 }
@@ -57,12 +79,12 @@ export async function ensureUserDoc(authUser: User): Promise<UserDoc> {
   if (!snap.exists()) {
     await setDoc(
       ref,
-      {
+      stripUndefinedDeep({
         ...base,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
         lastLoginAt: serverTimestamp(),
-      },
+      }),
       { merge: true }
     );
     return base;
@@ -95,7 +117,7 @@ export async function getMasterProfile(uid: string): Promise<MasterProfileDoc | 
 export async function saveMasterProfile(uid: string, profile: MasterProfileDoc) {
   await setDoc(
     doc(db, "users", uid, "master_profile", "main"),
-    { ...profile, updatedAt: serverTimestamp() },
+    stripUndefinedDeep({ ...profile, updatedAt: serverTimestamp() }),
     { merge: true }
   );
 }
@@ -113,15 +135,15 @@ export async function saveOnboarding(uid: string, patch: Partial<UserDoc>, profi
   const batch = writeBatch(db);
   batch.set(
     userRef,
-    {
+    stripUndefinedDeep({
       ...patch,
       role: patch.role ?? "student",
       onboardedAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-    },
+    }),
     { merge: true }
   );
-  batch.set(masterRef, { ...profilePatch, updatedAt: serverTimestamp() }, { merge: true });
+  batch.set(masterRef, stripUndefinedDeep({ ...profilePatch, updatedAt: serverTimestamp() }), { merge: true });
 
   // Optional: ensure institute member record for TPO views
   if (instituteMember?.instituteId) {
@@ -133,13 +155,12 @@ export async function saveOnboarding(uid: string, patch: Partial<UserDoc>, profi
       instituteId;
     batch.set(
       instRef,
-      {
+      stripUndefinedDeep({
         name: instituteName,
-        code: undefined,
         isActive: true,
         updatedAt: serverTimestamp(),
         createdAt: serverTimestamp(),
-      },
+      }),
       { merge: true }
     );
 
@@ -190,13 +211,13 @@ export async function connectUserToInstitute(args: {
   const batch = writeBatch(db);
   batch.set(
     instRef,
-    {
+    stripUndefinedDeep({
       name,
       code: instituteCode?.trim() ? instituteCode.trim().toUpperCase() : undefined,
       isActive: true,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
-    },
+    }),
     { merge: true }
   );
 
