@@ -3,7 +3,6 @@ import { SourceBadge } from "@/components/SourceBadge";
 import { MatchScore } from "@/components/MatchScore";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-// ad
 import {
   Sparkles,
   Briefcase,
@@ -28,6 +27,7 @@ import {
   jobIdFromAny,
   listApplications,
   listInstituteJobs,
+  listJobsFeedForUser,
   listRecommendations,
   listUpcomingEvents,
 } from "@/lib/firestore";
@@ -113,6 +113,29 @@ export default function Dashboard() {
     staleTime: 30_000,
   });
 
+  // ✅ Fallback for Home: show top jobs from visible feed when recommendations are empty.
+  const { data: fallbackJobs, isLoading: fallbackLoading } = useQuery({
+    queryKey: ["homeFallbackJobs", authUser?.uid, userDoc?.instituteId],
+    enabled: !!authUser?.uid,
+    queryFn: async () => {
+      if (!authUser?.uid) return [] as JobUI[];
+      const rows = await listJobsFeedForUser({
+        uid: authUser.uid,
+        instituteId: userDoc?.instituteId ?? null,
+        take: 30,
+      });
+      // Compute match locally from master profile
+      return rows
+        .map((r) => {
+          const match = computeMatch(r.data, profile);
+          return toJobUI(r.id, r.data, match.score, match.reasons, r.data.visibility === "institute");
+        })
+        .sort((a, b) => b.matchScore - a.matchScore)
+        .slice(0, 12);
+    },
+    staleTime: 20_000,
+  });
+
   const { data: instituteJobs } = useQuery({
     queryKey: ["instituteJobs", userDoc?.instituteId],
     enabled: !!userDoc?.instituteId,
@@ -140,15 +163,16 @@ export default function Dashboard() {
     staleTime: 15_000,
   });
 
-  const priorityJobs = (recJobs ?? []).slice(0, 6);
+  const prioritySource = (recJobs ?? []).length > 0 ? (recJobs ?? []) : (fallbackJobs ?? []);
+  const priorityJobs = prioritySource.slice(0, 6);
 
-  const kpis = computeKPIs(recJobs ?? [], apps ?? [], upcoming ?? []);
+  const kpis = computeKPIs(prioritySource, apps ?? [], upcoming ?? []);
 
   const recentActivity = (apps ?? [])
     .slice(0, 5)
     .map((a) => ({
       id: a.id,
-      text: `Updated: ${a.data.status.replace(/_/g, " ")} — ${jobIdFromAny(a.data.jobId)}`,
+      text: `Updated: ${String(a.data.status).replace(/_/g, " ")} — ${jobIdFromAny(a.data.jobId)}`,
       time: a.data.updatedAt ? timeAgo((a.data.updatedAt as any).toMillis?.()) : "—",
       icon: a.data.status === "tailored" ? "file" : a.data.status === "applied" ? "check" : "calendar",
     }));
@@ -202,11 +226,11 @@ export default function Dashboard() {
             </Link>
           </div>
 
-          {recLoading ? (
-            <Card className="card-elevated p-6 text-sm text-muted-foreground">Loading recommendations…</Card>
+          {recLoading || fallbackLoading ? (
+            <Card className="card-elevated p-6 text-sm text-muted-foreground">Loading priority jobs…</Card>
           ) : priorityJobs.length === 0 ? (
             <Card className="card-elevated p-6 text-sm text-muted-foreground">
-              No recommendations yet. Add more skills in your profile to improve matching.
+              No priority jobs yet. Go to Jobs to browse openings and start tracking.
             </Card>
           ) : (
             <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">

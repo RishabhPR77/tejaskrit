@@ -1,4 +1,7 @@
 // src/lib/firestore.ts
+// Firestore data-access layer for Tejaskrit Candidate Panel
+// This version avoids composite-index dependencies by not using orderBy with where filters.
+
 import {
   collection,
   doc,
@@ -16,15 +19,17 @@ import {
   Timestamp,
 } from "firebase/firestore";
 import type { User } from "firebase/auth";
+
 import { db } from "./firebase";
 import type {
   ApplicationDoc,
   ApplicationStatusKey,
+  EventDoc,
+  InstituteDoc,
   JobDoc,
   MasterProfileDoc,
   NotificationDoc,
   RecommendationDoc,
-  InstituteDoc,
   UserDoc,
 } from "./types";
 import { slugify } from "./utils";
@@ -33,7 +38,7 @@ import { slugify } from "./utils";
 // Helpers
 // ---------------------------
 
-// Firestore does NOT allow `undefined` values anywhere in the object.
+// Firestore does NOT allow `undefined` values anywhere in an object.
 function stripUndefinedDeep<T>(value: T): T {
   if (value === undefined) return undefined as unknown as T;
   if (value === null) return value;
@@ -62,7 +67,6 @@ export function jobIdFromAny(jobIdOrRef: string) {
 }
 
 function tsMillis(x: any): number {
-  // supports Firestore Timestamp or JS Date
   if (!x) return 0;
   if (typeof x?.toMillis === "function") return x.toMillis();
   if (x instanceof Date) return x.getTime();
@@ -70,18 +74,12 @@ function tsMillis(x: any): number {
 }
 
 function jobSortKey(j: JobDoc): number {
-  // prefer lastSeenAt -> postedAt -> createdAt -> updatedAt
-  return (
-    tsMillis((j as any).lastSeenAt) ||
-    tsMillis((j as any).postedAt) ||
-    tsMillis((j as any).createdAt) ||
-    tsMillis((j as any).updatedAt) ||
-    0
-  );
+  const a: any = j;
+  return tsMillis(a.lastSeenAt) || tsMillis(a.postedAt) || tsMillis(a.createdAt) || tsMillis(a.updatedAt) || 0;
 }
 
 // ---------------------------
-// Users + Profile
+// Users
 // ---------------------------
 
 export async function ensureUserDoc(authUser: User): Promise<UserDoc> {
@@ -133,6 +131,10 @@ export async function getUserDoc(uid: string): Promise<UserDoc | null> {
   return snap.exists() ? (snap.data() as UserDoc) : null;
 }
 
+// ---------------------------
+// Master Profile
+// ---------------------------
+
 export async function getMasterProfile(uid: string): Promise<MasterProfileDoc | null> {
   const snap = await getDoc(doc(db, "users", uid, "master_profile", "main"));
   return snap.exists() ? (snap.data() as MasterProfileDoc) : null;
@@ -146,72 +148,15 @@ export async function saveMasterProfile(uid: string, profile: MasterProfileDoc) 
   );
 }
 
-export async function saveOnboarding(
-  uid: string,
-  patch: Partial<UserDoc>,
-  profilePatch: MasterProfileDoc,
-  instituteMember?: {
-    instituteId?: string | null;
-    instituteName?: string;
-    branch?: string;
-    batch?: string;
-    cgpa?: number;
-  }
-) {
-  const userRef = doc(db, "users", uid);
-  const masterRef = doc(db, "users", uid, "master_profile", "main");
-
-  const batch = writeBatch(db);
-  batch.set(
-    userRef,
-    stripUndefinedDeep({
-      ...patch,
-      role: patch.role ?? "student",
-      onboardedAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    }),
-    { merge: true }
-  );
-  batch.set(masterRef, stripUndefinedDeep({ ...profilePatch, updatedAt: serverTimestamp() }), { merge: true });
-
-  if (instituteMember?.instituteId) {
-    const instituteId = instituteMember.instituteId;
-    const instRef = doc(db, "institutes", instituteId);
-    const instituteName =
-      instituteMember.instituteName?.trim() || profilePatch?.education?.[0]?.institute?.trim() || instituteId;
-
-    batch.set(
-      instRef,
-      stripUndefinedDeep({
-        name: instituteName,
-        isActive: true,
-        updatedAt: serverTimestamp(),
-        createdAt: serverTimestamp(),
-      }),
-      { merge: true }
-    );
-
-    const memRef = doc(db, "institutes", instituteId, "members", uid);
-    batch.set(
-      memRef,
-      {
-        uid,
-        role: "student",
-        branch: instituteMember.branch ?? "",
-        batch: instituteMember.batch ?? "",
-        cgpa: instituteMember.cgpa ?? null,
-        status: "active",
-        joinedAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
-  }
-
-  await batch.commit();
+export async function saveUserConsents(uid: string, consents: UserDoc["consents"]) {
+  await updateDoc(doc(db, "users", uid), { consents, updatedAt: serverTimestamp() } as any);
 }
 
+// ---------------------------
+// Institute connection
+// ---------------------------
+
 export async function listInstitutes(take = 50): Promise<Array<{ id: string; data: InstituteDoc }>> {
-  // no orderBy -> no composite index needed
   const q = query(collection(db, "institutes"), limit(take));
   const snap = await getDocs(q);
   const rows = snap.docs.map((d) => ({ id: d.id, data: d.data() as InstituteDoc }));
@@ -278,20 +223,86 @@ export async function connectUserToInstitute(args: {
   return instituteId;
 }
 
+export async function saveOnboarding(
+  uid: string,
+  patch: Partial<UserDoc>,
+  profilePatch: MasterProfileDoc,
+  instituteMember?: {
+    instituteId?: string | null;
+    instituteName?: string;
+    branch?: string;
+    batch?: string;
+    cgpa?: number;
+  }
+) {
+  const userRef = doc(db, "users", uid);
+  const masterRef = doc(db, "users", uid, "master_profile", "main");
+
+  const batch = writeBatch(db);
+  batch.set(
+    userRef,
+    stripUndefinedDeep({
+      ...patch,
+      role: patch.role ?? "student",
+      onboardedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    }),
+    { merge: true }
+  );
+  batch.set(masterRef, stripUndefinedDeep({ ...profilePatch, updatedAt: serverTimestamp() }), { merge: true });
+
+  if (instituteMember?.instituteId) {
+    const instituteId = instituteMember.instituteId;
+    const instRef = doc(db, "institutes", instituteId);
+    const instituteName =
+      instituteMember.instituteName?.trim() || profilePatch?.education?.[0]?.institute?.trim() || instituteId;
+
+    batch.set(
+      instRef,
+      stripUndefinedDeep({
+        name: instituteName,
+        isActive: true,
+        updatedAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+      }),
+      { merge: true }
+    );
+
+    const memRef = doc(db, "institutes", instituteId, "members", uid);
+    batch.set(
+      memRef,
+      {
+        uid,
+        role: "student",
+        branch: instituteMember.branch ?? "",
+        batch: instituteMember.batch ?? "",
+        cgpa: instituteMember.cgpa ?? null,
+        status: "active",
+        joinedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+  }
+
+  await batch.commit();
+}
+
 // ---------------------------
-// Jobs (INDEX-FREE QUERIES)
+// Recommendations
 // ---------------------------
 
 export async function listRecommendations(uid: string, take = 50): Promise<Array<{ id: string; data: RecommendationDoc }>> {
-  // subcollection orderBy usually fine; keep it
   const q = query(collection(db, "users", uid, "recommendations"), limit(take));
   const snap = await getDocs(q);
   const rows = snap.docs.map((d) => ({ id: d.id, data: d.data() as RecommendationDoc }));
   return rows.sort((a, b) => (b.data.score ?? 0) - (a.data.score ?? 0));
 }
 
+// ---------------------------
+// Jobs
+// ---------------------------
+
 export async function listPublicJobs(take = 50): Promise<Array<{ id: string; data: JobDoc }>> {
-  // ✅ NO orderBy (avoids composite index)
   const q = query(collection(db, "jobs"), where("visibility", "==", "public"), limit(take));
   const snap = await getDocs(q);
   const rows = snap.docs.map((d) => ({ id: d.id, data: d.data() as JobDoc }));
@@ -299,7 +310,6 @@ export async function listPublicJobs(take = 50): Promise<Array<{ id: string; dat
 }
 
 export async function listInstituteJobs(instituteId: string, take = 50): Promise<Array<{ id: string; data: JobDoc }>> {
-  // ✅ query only by instituteId (single-field index), then filter visibility client-side
   const q = query(collection(db, "jobs"), where("instituteId", "==", instituteId), limit(take));
   const snap = await getDocs(q);
   const rows = snap.docs
@@ -317,27 +327,20 @@ export async function listPrivateJobs(uid: string, take = 50): Promise<Array<{ i
   return rows.sort((a, b) => jobSortKey(b.data) - jobSortKey(a.data));
 }
 
-/**
- * ✅ Single entry-point for the candidate Jobs page.
- * No composite indexes required.
- */
 export async function listJobsFeedForUser(args: {
   uid: string;
   instituteId?: string | null;
   take?: number;
 }): Promise<Array<{ id: string; data: JobDoc }>> {
   const { uid, instituteId, take = 100 } = args;
-
   const [pub, inst, priv] = await Promise.all([
     listPublicJobs(Math.min(take, 100)),
     instituteId ? listInstituteJobs(instituteId, Math.min(take, 100)) : Promise.resolve([]),
     listPrivateJobs(uid, Math.min(take, 100)),
   ]);
-
   const map = new Map<string, { id: string; data: JobDoc }>();
   [...pub, ...inst, ...priv].forEach((r) => map.set(r.id, r));
-  const merged = Array.from(map.values()).sort((a, b) => jobSortKey(b.data) - jobSortKey(a.data));
-  return merged.slice(0, take);
+  return Array.from(map.values()).sort((a, b) => jobSortKey(b.data) - jobSortKey(a.data)).slice(0, take);
 }
 
 export async function getJobsByIds(ids: string[]): Promise<Record<string, JobDoc>> {
@@ -353,8 +356,15 @@ export async function getJobsByIds(ids: string[]): Promise<Record<string, JobDoc
 }
 
 // ---------------------------
-// Applications (INDEX-FREE)
+// Applications
 // ---------------------------
+
+export async function listApplications(uid: string): Promise<Array<{ id: string; data: ApplicationDoc }>> {
+  const q = query(collection(db, "applications"), where("userId", "==", uid), limit(300));
+  const snap = await getDocs(q);
+  const rows = snap.docs.map((d) => ({ id: d.id, data: d.data() as ApplicationDoc }));
+  return rows.sort((a, b) => tsMillis((b.data as any).updatedAt) - tsMillis((a.data as any).updatedAt));
+}
 
 export async function upsertApplicationForJob(args: {
   uid: string;
@@ -366,7 +376,6 @@ export async function upsertApplicationForJob(args: {
   origin?: ApplicationDoc["origin"];
 }) {
   const { uid, instituteId, jobId, status, matchScore, matchReasons, origin } = args;
-
   const id = `${uid}__${jobId}`;
   const ref = doc(db, "applications", id);
   const snap = await getDoc(ref);
@@ -413,8 +422,7 @@ export async function upsertApplicationForJob(args: {
 }
 
 export async function updateApplicationStatus(appId: string, uid: string, status: ApplicationStatusKey) {
-  const ref = doc(db, "applications", appId);
-  await updateDoc(ref, {
+  await updateDoc(doc(db, "applications", appId), {
     status,
     updatedAt: serverTimestamp(),
     appliedAt: status === "applied" ? serverTimestamp() : null,
@@ -436,28 +444,17 @@ export async function saveApplicationNotes(appId: string, uid: string, notes: st
   });
 }
 
-export async function listApplications(uid: string): Promise<Array<{ id: string; data: ApplicationDoc }>> {
-  // ✅ NO orderBy (avoids composite index on userId+updatedAt)
-  const q = query(collection(db, "applications"), where("userId", "==", uid), limit(300));
-  const snap = await getDocs(q);
-
-  const rows = snap.docs.map((d) => ({ id: d.id, data: d.data() as ApplicationDoc }));
-  // client-side sort by updatedAt desc
-  return rows.sort((a, b) => tsMillis((b.data as any).updatedAt) - tsMillis((a.data as any).updatedAt));
-}
-
 export async function addApplicationEvent(args: {
   applicationId: string;
   uid: string;
-  type: "oa" | "interview" | "deadline" | "followup";
+  type: EventDoc["type"];
   scheduledAt: Date;
   title?: string;
   link?: string;
   description?: string;
 }) {
   const { applicationId, uid, type, scheduledAt, title, link, description } = args;
-  const ref = collection(db, "applications", applicationId, "events");
-  await addDoc(ref, {
+  await addDoc(collection(db, "applications", applicationId, "events"), {
     type,
     scheduledAt: Timestamp.fromDate(scheduledAt),
     title: title ?? null,
@@ -475,19 +472,17 @@ export async function addApplicationEvent(args: {
 
 export async function listUpcomingEvents(uid: string, take = 10) {
   const apps = await listApplications(uid);
-  const now = Timestamp.now();
-
+  const nowMs = Date.now();
   const results: Array<{ applicationId: string; jobId: string; event: any }> = [];
 
   await Promise.all(
     apps.map(async ({ id, data }) => {
-      const evQ = query(collection(db, "applications", id, "events"), limit(5));
+      const evQ = query(collection(db, "applications", id, "events"), limit(10));
       const snap = await getDocs(evQ);
       const upcoming = snap.docs
         .map((d) => ({ id: d.id, ...(d.data() as any) }))
-        .filter((e) => e.scheduledAt && e.scheduledAt.toMillis() >= now.toMillis())
+        .filter((e) => e.scheduledAt?.toMillis?.() >= nowMs)
         .sort((a, b) => a.scheduledAt.toMillis() - b.scheduledAt.toMillis())[0];
-
       if (upcoming) results.push({ applicationId: id, jobId: jobIdFromAny(data.jobId), event: upcoming });
     })
   );
@@ -498,7 +493,7 @@ export async function listUpcomingEvents(uid: string, take = 10) {
 }
 
 // ---------------------------
-// Notifications + Consents
+// Notifications
 // ---------------------------
 
 export async function listUserNotifications(uid: string, take = 50): Promise<Array<{ id: string; data: NotificationDoc }>> {
@@ -516,18 +511,13 @@ export async function markAllNotificationsRead(uid: string) {
   const q = query(collection(db, "users", uid, "notifications"), limit(200));
   const snap = await getDocs(q);
   if (snap.empty) return;
-
   const batch = writeBatch(db);
   snap.docs.forEach((d) => batch.update(d.ref, { read: true } as any));
   await batch.commit();
 }
 
-export async function saveUserConsents(uid: string, consents: UserDoc["consents"]) {
-  await updateDoc(doc(db, "users", uid), { consents, updatedAt: serverTimestamp() } as any);
-}
-
 // ---------------------------
-// (Optional helpers you already used)
+// Resume helpers
 // ---------------------------
 
 export async function createPrivateJobForUser(args: {
@@ -563,14 +553,10 @@ export async function createPrivateJobForUser(args: {
   return ref.id;
 }
 
-// These two are in your project already; keep if you use them in UI.
-// If not present in your current version, ignore.
-
 export async function exportUserData(uid: string) {
   const userSnap = await getDoc(doc(db, "users", uid));
   const profileSnap = await getDoc(doc(db, "users", uid, "master_profile", "main"));
   const apps = await listApplications(uid);
-
   return {
     user: userSnap.exists() ? userSnap.data() : null,
     master_profile: profileSnap.exists() ? profileSnap.data() : null,
@@ -579,7 +565,6 @@ export async function exportUserData(uid: string) {
 }
 
 export async function deleteUserData(uid: string) {
-  // MVP best-effort cleanup
   await deleteDoc(doc(db, "users", uid, "master_profile", "main")).catch(() => {});
   const apps = await listApplications(uid);
   for (const a of apps) {
