@@ -144,6 +144,32 @@ export default function DrivesJobs() {
     [selectedJobId, jobs],
   );
 
+
+  function toDateAny(v: any): Date | null {
+  if (!v) return null;
+
+  // already a Date
+  if (v instanceof Date) return v;
+
+  // Firestore Timestamp
+  if (typeof v?.toDate === "function") return v.toDate();
+  if (typeof v?.toMillis === "function") return new Date(v.toMillis());
+
+  // Raw timestamp object {seconds, nanoseconds}
+  if (typeof v?.seconds === "number") return new Date(v.seconds * 1000);
+
+  // ISO/string
+  if (typeof v === "string") {
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // number milliseconds
+  if (typeof v === "number") return new Date(v);
+
+  return null;
+}
+
   const estimatedEligible = useMemo(() => {
     const base = 180;
     const multiplier = Math.max(1, form.eligibleBranches.length);
@@ -366,7 +392,7 @@ export default function DrivesJobs() {
 
               {!loading &&
                 filtered.map((r) => {
-                  const deadline = toDate(r.data.sourceMeta?.deadlineAt ?? null);
+                  const deadline = toDateAny(r.data.sourceMeta?.deadlineAt);
                   const status =
                     r.data.status === "closed"
                       ? "Closed"
@@ -431,7 +457,7 @@ export default function DrivesJobs() {
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <Label className="text-xs">Deadline</Label>
-                  <div className="text-sm">{formatDate(toDate(selected.data.sourceMeta?.deadlineAt ?? null))}</div>
+                  <div className="text-sm">{formatDate(toDateAny(selected.data.sourceMeta?.deadlineAt))}</div>
                 </div>
                 <div>
                   <Label className="text-xs">Applicants</Label>
