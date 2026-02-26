@@ -28,6 +28,7 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogDescription,
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -58,7 +59,6 @@ type StudentDoc = {
   cgpa: number;
   status: string;
 };
-
 type Student = StudentDoc & { id: string };
 
 type DriveDoc = {
@@ -69,7 +69,6 @@ type DriveDoc = {
   status: string;
   verified?: boolean;
 };
-
 type Drive = DriveDoc & { id: string };
 
 type AppDoc = {
@@ -84,7 +83,7 @@ type AppDoc = {
   company: string;
   role: string;
 
-  status: string; // Applied/OA/Interview/Offer/Rejected/Joined
+  status: string;
   appliedAt?: Timestamp | null;
 
   nextEventLabel?: string | null;
@@ -99,8 +98,9 @@ type AppDoc = {
   driveId?: string | null;
   driveTitle?: string | null;
 };
-
 type Application = AppDoc & { id: string };
+
+const NONE_VALUE = "__none__";
 
 function toDate(ts?: Timestamp | null) {
   if (!ts) return null;
@@ -123,6 +123,17 @@ function toDatetimeLocal(d: Date | null) {
   return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
 }
 
+function msAny(ts: any) {
+  try {
+    if (!ts) return 0;
+    if (typeof ts.toMillis === "function") return ts.toMillis();
+    if (typeof ts.toDate === "function") return ts.toDate().getTime();
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
 export default function Applications() {
   const { toast } = useToast();
   const { profile, user } = useAuth();
@@ -138,19 +149,18 @@ export default function Applications() {
   const [selected, setSelected] = useState<string[]>([]);
   const [detailId, setDetailId] = useState<string | null>(null);
 
-  // Create application dialog
+  // Create dialog
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-
   const [createForm, setCreateForm] = useState({
     studentId: "",
-    driveId: "",
+    driveId: "", // "" means none linked
     company: "",
     role: "",
     status: "Applied",
-    appliedLocal: "", // datetime-local
+    appliedLocal: "",
     nextEventLabel: "",
-    nextEventLocal: "", // datetime-local
+    nextEventLocal: "",
     outcome: "Pending",
     notes: "",
     resumeName: "",
@@ -165,7 +175,7 @@ export default function Applications() {
   );
   const [announceMessage, setAnnounceMessage] = useState("");
 
-  // Detail edit state
+  // Detail edit
   const detail = useMemo(
     () => (detailId ? (apps.find((a) => a.id === detailId) ?? null) : null),
     [detailId, apps],
@@ -190,6 +200,7 @@ export default function Applications() {
       collection(db, "applications"),
       where("instituteId", "==", instituteId),
     );
+
     const unsub = onSnapshot(
       q,
       (snap) => {
@@ -197,21 +208,24 @@ export default function Applications() {
           id: d.id,
           ...(d.data() as AppDoc),
         }));
-        // sort latest first without orderBy (avoids index)
+
+        // client sort (no Firestore orderBy)
         list.sort((a, b) => {
           const ams =
-            a.updatedAt?.toDate?.()?.getTime?.() ??
-            a.createdAt?.toDate?.()?.getTime?.() ??
-            a.appliedAt?.toDate?.()?.getTime?.() ??
-            0;
+            msAny(a.updatedAt) ||
+            msAny(a.createdAt) ||
+            (toDate(a.appliedAt ?? null)?.getTime() ?? 0);
           const bms =
-            b.updatedAt?.toDate?.()?.getTime?.() ??
-            b.createdAt?.toDate?.()?.getTime?.() ??
-            b.appliedAt?.toDate?.()?.getTime?.() ??
-            0;
+            msAny(b.updatedAt) ||
+            msAny(b.createdAt) ||
+            (toDate(b.appliedAt ?? null)?.getTime() ?? 0);
           return bms - ams;
         });
+
         setApps(list);
+        setSelected((prev) =>
+          prev.filter((id) => list.some((x) => x.id === id)),
+        );
         setLoading(false);
       },
       (err) => {
@@ -228,7 +242,7 @@ export default function Applications() {
     return () => unsub();
   }, [instituteId, toast]);
 
-  // realtime students (for dropdown)
+  // realtime students
   useEffect(() => {
     if (!instituteId) return;
     const q = query(
@@ -246,7 +260,7 @@ export default function Applications() {
     return () => unsub();
   }, [instituteId]);
 
-  // realtime drives (optional dropdown)
+  // realtime drives
   useEffect(() => {
     if (!instituteId) return;
     const q = query(
@@ -258,10 +272,9 @@ export default function Applications() {
         id: d.id,
         ...(d.data() as DriveDoc),
       }));
-      // sort by deadline desc
       list.sort((a, b) => {
-        const ams = a.deadlineAt?.toDate?.()?.getTime?.() ?? 0;
-        const bms = b.deadlineAt?.toDate?.()?.getTime?.() ?? 0;
+        const ams = toDate(a.deadlineAt ?? null)?.getTime?.() ?? 0;
+        const bms = toDate(b.deadlineAt ?? null)?.getTime?.() ?? 0;
         return bms - ams;
       });
       setDrives(list);
@@ -288,11 +301,12 @@ export default function Applications() {
     );
 
   const selectAll = () => {
+    if (filtered.length === 0) return;
     if (selected.length === filtered.length) setSelected([]);
     else setSelected(filtered.map((a) => a.id));
   };
 
-  // when opening detail, hydrate draft
+  // hydrate detail draft when opening
   useEffect(() => {
     if (!detail) return;
     setDetailDraft({
@@ -328,11 +342,18 @@ export default function Applications() {
     setCreateOpen(true);
   };
 
-  const applyDriveToForm = (driveId: string) => {
-    const d = drives.find((x) => x.id === driveId);
+  // IMPORTANT: no SelectItem can have value="".
+  // We map "None" to a safe string and handle it here.
+  const onDriveChange = (value: string) => {
+    if (value === NONE_VALUE) {
+      setCreateForm((p) => ({ ...p, driveId: "" }));
+      return;
+    }
+
+    const d = drives.find((x) => x.id === value);
     setCreateForm((p) => ({
       ...p,
-      driveId,
+      driveId: value,
       company: d?.company ?? p.company,
       role: d?.title ?? p.role,
     }));
@@ -367,9 +388,10 @@ export default function Applications() {
       ? Timestamp.fromDate(new Date(createForm.nextEventLocal))
       : null;
 
-    const drive = createForm.driveId
-      ? drives.find((d) => d.id === createForm.driveId)
-      : null;
+    const drive =
+      createForm.driveId && createForm.driveId.trim()
+        ? drives.find((d) => d.id === createForm.driveId)
+        : null;
 
     setCreating(true);
     try {
@@ -462,6 +484,7 @@ export default function Applications() {
       nextEvent: a.nextEventLabel ?? "",
       nextEventAt: toDate(a.nextEventAt ?? null)?.toISOString?.() ?? "",
       outcome: a.outcome ?? "",
+      drive: a.driveTitle ?? "",
     }));
 
     downloadCSV(`applications_${Date.now()}.csv`, rows);
@@ -672,9 +695,11 @@ export default function Applications() {
                     <td className="px-5 py-4 text-sm text-foreground">
                       {a.role}
                     </td>
+
                     <td className="px-5 py-4 text-sm text-foreground">
                       {a.studentName}
                     </td>
+
                     <td className="px-5 py-4">
                       <StatusBadge status={a.status} />
                     </td>
@@ -702,6 +727,9 @@ export default function Applications() {
         <DialogContent className="max-w-xl">
           <DialogHeader>
             <DialogTitle>Add Application</DialogTitle>
+            <DialogDescription>
+              Create a new application entry for tracking (stored in Firestore).
+            </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4">
@@ -735,14 +763,14 @@ export default function Applications() {
               <div className="space-y-2">
                 <Label>Drive (optional)</Label>
                 <Select
-                  value={createForm.driveId}
-                  onValueChange={(v) => applyDriveToForm(v)}
+                  value={createForm.driveId ? createForm.driveId : NONE_VALUE}
+                  onValueChange={onDriveChange}
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="Link to drive" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">None</SelectItem>
+                    <SelectItem value={NONE_VALUE}>None</SelectItem>
                     {drives.map((d) => (
                       <SelectItem key={d.id} value={d.id}>
                         {d.company} — {d.title}
@@ -858,7 +886,10 @@ export default function Applications() {
                 <Input
                   value={createForm.resumeName}
                   onChange={(e) =>
-                    setCreateForm((p) => ({ ...p, resumeName: e.target.value }))
+                    setCreateForm((p) => ({
+                      ...p,
+                      resumeName: e.target.value,
+                    }))
                   }
                   placeholder="resume_student.pdf"
                 />
@@ -902,6 +933,9 @@ export default function Applications() {
         <DialogContent className="max-w-xl">
           <DialogHeader>
             <DialogTitle>Send Announcement</DialogTitle>
+            <DialogDescription>
+              This will create an announcement in Firestore for your institute.
+            </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-4">
@@ -919,9 +953,6 @@ export default function Applications() {
                 onChange={(e) => setAnnounceMessage(e.target.value)}
                 className="min-h-[160px]"
               />
-              <p className="text-xs text-muted-foreground">
-                This will be saved in Firestore under Announcements.
-              </p>
             </div>
 
             <div className="flex justify-end">
@@ -1075,6 +1106,10 @@ export default function Applications() {
                   <Save className="w-4 h-4 mr-1.5" />
                   {detailSaving ? "Saving…" : "Save"}
                 </Button>
+              </div>
+
+              <div className="text-xs text-muted-foreground">
+                Applied: {fmtShort(toDate(detail.appliedAt ?? null))}
               </div>
             </div>
           </div>
