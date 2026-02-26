@@ -10,7 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { LayoutGrid, List, Plus, CalendarDays, StickyNote, Sparkles } from "lucide-react";
+import { LayoutGrid, List, Plus, CalendarDays, StickyNote, Sparkles, Lock } from "lucide-react";
 import { motion } from "framer-motion";
 import { useAuth } from "@/contexts/AuthProvider";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -49,6 +49,10 @@ type AppUI = {
   nextEvent?: string;
   nextEventDate?: string;
   notes?: string;
+
+  // ✅ locking
+  instituteLocked: boolean;
+  lockReason?: string;
 };
 
 function fmtDate(ts: any) {
@@ -100,6 +104,10 @@ export default function Tracker() {
     return rows.map((r) => {
       const jobId = jobIdFromAny(r.data.jobId);
       const job = map[jobId] as JobDoc | undefined;
+
+      // ✅ Institute Verified lock: visibility=institute OR source=tpo (fallback for older docs)
+      const instituteLocked = (job?.visibility === "institute") || (job?.source === "tpo");
+
       return {
         id: r.id,
         jobId,
@@ -109,9 +117,32 @@ export default function Tracker() {
         matchScore: r.data.matchScore ?? 0,
         appliedOn: r.data.appliedAt ? fmtDate(r.data.appliedAt) : undefined,
         notes: r.data.notes ?? "",
+        instituteLocked,
+        lockReason: instituteLocked ? "Institute Verified drives can be updated only by TPO." : undefined,
       };
     });
   }, [appRows, jobMap]);
+
+  const onChangeStatus = async (app: AppUI, next: ApplicationStatusKey) => {
+    if (!authUser?.uid) return;
+
+    if (app.instituteLocked) {
+      toast({
+        title: "Status locked",
+        description: app.lockReason ?? "This application is controlled by your institute.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    try {
+      await updateApplicationStatus(app.id, authUser.uid, next);
+      toast({ title: "Status updated", description: `Moved to ${statusLabel(next)}.` });
+      qc.invalidateQueries({ queryKey: ["applications", authUser.uid] });
+    } catch (e: any) {
+      toast({ title: "Failed", description: e?.message ?? "Could not update status.", variant: "destructive" });
+    }
+  };
 
   const onSaveEvent = async () => {
     if (!authUser?.uid) return;
@@ -123,6 +154,8 @@ export default function Tracker() {
       toast({ title: "Missing date", description: "Pick a date and time." });
       return;
     }
+
+    const app = apps.find((a) => a.id === eventForm.applicationId);
 
     try {
       await addApplicationEvent({
@@ -142,15 +175,22 @@ export default function Tracker() {
         description: eventForm.description,
       });
 
-      // auto-update status for OA/Interview scheduling
-      if (eventForm.type === "oa") {
-        await updateApplicationStatus(eventForm.applicationId, authUser.uid, "oa_scheduled");
-      }
-      if (eventForm.type === "interview") {
-        await updateApplicationStatus(eventForm.applicationId, authUser.uid, "interview_scheduled");
+      // ✅ auto-update status only for non-institute applications
+      if (!app?.instituteLocked) {
+        if (eventForm.type === "oa") {
+          await updateApplicationStatus(eventForm.applicationId, authUser.uid, "oa_scheduled");
+        }
+        if (eventForm.type === "interview") {
+          await updateApplicationStatus(eventForm.applicationId, authUser.uid, "interview_scheduled");
+        }
       }
 
-      toast({ title: "Event saved", description: "Your tracker has been updated." });
+      toast({
+        title: "Event saved",
+        description: app?.instituteLocked
+          ? "Event saved. Status is locked by institute."
+          : "Your tracker has been updated.",
+      });
       setEventOpen(false);
       qc.invalidateQueries({ queryKey: ["applications", authUser.uid] });
     } catch (e: any) {
@@ -215,9 +255,9 @@ export default function Tracker() {
         {isLoading ? (
           <Card className="card-elevated p-6 text-sm text-muted-foreground">Loading tracker…</Card>
         ) : view === "kanban" ? (
-          <KanbanView apps={apps} onNotes={openNotes} />
+          <KanbanView apps={apps} onNotes={openNotes} onChangeStatus={onChangeStatus} />
         ) : (
-          <TableView apps={apps} onNotes={openNotes} />
+          <TableView apps={apps} onNotes={openNotes} onChangeStatus={onChangeStatus} />
         )}
 
         {/* Add Event Modal */}
@@ -236,7 +276,7 @@ export default function Tracker() {
                   <SelectContent>
                     {apps.map((a) => (
                       <SelectItem key={a.id} value={a.id}>
-                        {a.company} — {a.role}
+                        {a.company} — {a.role}{a.instituteLocked ? " (Institute Verified)" : ""}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -329,7 +369,53 @@ export default function Tracker() {
   );
 }
 
-function KanbanView({ apps, onNotes }: { apps: AppUI[]; onNotes: (app: AppUI) => void }) {
+function StatusPicker({
+  value,
+  disabled,
+  disabledReason,
+  onChange,
+}: {
+  value: ApplicationStatusKey;
+  disabled: boolean;
+  disabledReason?: string;
+  onChange: (v: ApplicationStatusKey) => void;
+}) {
+  const label = statusLabel(value);
+  return (
+    <div className="space-y-1">
+      <Select value={value} onValueChange={(v) => onChange(v as ApplicationStatusKey)} disabled={disabled}>
+        <SelectTrigger className="h-8 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {STATUS_COLUMNS.map((s) => (
+            <SelectItem key={s} value={s}>
+              {statusLabel(s)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {disabled ? (
+        <div className="text-[11px] text-muted-foreground flex items-center gap-1">
+          <Lock className="h-3 w-3" /> {disabledReason ?? "Locked"}
+        </div>
+      ) : null}
+      <div className="text-[11px] text-muted-foreground">
+        Current: <span className={`ml-1 px-2 py-0.5 rounded-full ${statusColors[label]}`}>{label}</span>
+      </div>
+    </div>
+  );
+}
+
+function KanbanView({
+  apps,
+  onNotes,
+  onChangeStatus,
+}: {
+  apps: AppUI[];
+  onNotes: (app: AppUI) => void;
+  onChangeStatus: (app: AppUI, next: ApplicationStatusKey) => void;
+}) {
   return (
     <div className="overflow-x-auto pb-4">
       <div className="flex gap-3 min-w-max">
@@ -355,27 +441,26 @@ function KanbanView({ apps, onNotes }: { apps: AppUI[]; onNotes: (app: AppUI) =>
                         </div>
                         <MatchScore score={app.matchScore} />
                       </div>
+
+                      <StatusPicker
+                        value={app.status}
+                        disabled={app.instituteLocked}
+                        disabledReason={app.lockReason}
+                        onChange={(v) => onChangeStatus(app, v)}
+                      />
+
                       {app.nextEventDate && (
                         <p className="text-xs text-muted-foreground flex items-center gap-1">
                           <CalendarDays className="h-3 w-3" /> {app.nextEvent} — {app.nextEventDate}
                         </p>
                       )}
-                      {app.notes && (
-                        <button
-                          className="text-left text-xs text-muted-foreground flex items-center gap-1 hover:text-foreground"
-                          onClick={() => onNotes(app)}
-                        >
-                          <StickyNote className="h-3 w-3" /> {app.notes}
-                        </button>
-                      )}
-                      {!app.notes && (
-                        <button
-                          className="text-left text-xs text-muted-foreground flex items-center gap-1 hover:text-foreground"
-                          onClick={() => onNotes(app)}
-                        >
-                          <StickyNote className="h-3 w-3" /> Add notes
-                        </button>
-                      )}
+
+                      <button
+                        className="text-left text-xs text-muted-foreground flex items-center gap-1 hover:text-foreground"
+                        onClick={() => onNotes(app)}
+                      >
+                        <StickyNote className="h-3 w-3" /> {app.notes ? app.notes : "Add notes"}
+                      </button>
                     </Card>
                   </motion.div>
                 ))}
@@ -391,7 +476,15 @@ function KanbanView({ apps, onNotes }: { apps: AppUI[]; onNotes: (app: AppUI) =>
   );
 }
 
-function TableView({ apps, onNotes }: { apps: AppUI[]; onNotes: (app: AppUI) => void }) {
+function TableView({
+  apps,
+  onNotes,
+  onChangeStatus,
+}: {
+  apps: AppUI[];
+  onNotes: (app: AppUI) => void;
+  onChangeStatus: (app: AppUI, next: ApplicationStatusKey) => void;
+}) {
   return (
     <Card className="card-elevated overflow-hidden">
       <Table>
@@ -406,27 +499,29 @@ function TableView({ apps, onNotes }: { apps: AppUI[]; onNotes: (app: AppUI) => 
           </TableRow>
         </TableHeader>
         <TableBody>
-          {apps.map((app) => {
-            const label = statusLabel(app.status);
-            return (
-              <TableRow key={app.id}>
-                <TableCell className="font-medium">{app.company}</TableCell>
-                <TableCell className="text-sm">{app.role}</TableCell>
-                <TableCell>
-                  <Badge className={`text-xs ${statusColors[label]}`}>{label}</Badge>
-                </TableCell>
-                <TableCell className="text-sm text-muted-foreground">{app.appliedOn || "—"}</TableCell>
-                <TableCell>
-                  <MatchScore score={app.matchScore} />
-                </TableCell>
-                <TableCell className="text-sm text-muted-foreground max-w-[220px]">
-                  <button className="hover:underline" onClick={() => onNotes(app)}>
-                    {app.notes || "Add notes"}
-                  </button>
-                </TableCell>
-              </TableRow>
-            );
-          })}
+          {apps.map((app) => (
+            <TableRow key={app.id}>
+              <TableCell className="font-medium">{app.company}</TableCell>
+              <TableCell className="text-sm">{app.role}</TableCell>
+              <TableCell className="min-w-[220px]">
+                <StatusPicker
+                  value={app.status}
+                  disabled={app.instituteLocked}
+                  disabledReason={app.lockReason}
+                  onChange={(v) => onChangeStatus(app, v)}
+                />
+              </TableCell>
+              <TableCell className="text-sm text-muted-foreground">{app.appliedOn || "—"}</TableCell>
+              <TableCell>
+                <MatchScore score={app.matchScore} />
+              </TableCell>
+              <TableCell className="text-sm text-muted-foreground max-w-[220px]">
+                <button className="hover:underline" onClick={() => onNotes(app)}>
+                  {app.notes || "Add notes"}
+                </button>
+              </TableCell>
+            </TableRow>
+          ))}
         </TableBody>
       </Table>
     </Card>
