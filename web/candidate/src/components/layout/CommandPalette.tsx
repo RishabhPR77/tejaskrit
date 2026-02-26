@@ -1,6 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
-import { Briefcase, FileText, LayoutDashboard, Search, Settings } from "lucide-react";
+import { Briefcase, FileText, LayoutDashboard, Search, Bell } from "lucide-react";
 import {
   CommandDialog,
   CommandEmpty,
@@ -9,7 +9,9 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { jobs } from "@/lib/mock-data";
+import { useAuth } from "@/contexts/AuthProvider";
+import { useQuery } from "@tanstack/react-query";
+import { getJobsByIds, jobIdFromAny, listRecommendations, listPublicJobs } from "@/lib/firestore";
 
 interface Props {
   open: boolean;
@@ -18,6 +20,7 @@ interface Props {
 
 export function CommandPalette({ open, onOpenChange }: Props) {
   const navigate = useNavigate();
+  const { authUser } = useAuth();
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -35,24 +38,66 @@ export function CommandPalette({ open, onOpenChange }: Props) {
     onOpenChange(false);
   };
 
+  const { data: topJobs } = useQuery({
+    queryKey: ["commandTopJobs", authUser?.uid],
+    enabled: !!authUser?.uid,
+    queryFn: async () => {
+      if (!authUser?.uid) return [];
+      const recs = await listRecommendations(authUser.uid, 5);
+      if (recs.length > 0) {
+        const ids = recs.map((r) => jobIdFromAny(r.data.jobId ?? r.id));
+        const map = await getJobsByIds(ids);
+        return recs
+          .map((r) => {
+            const id = jobIdFromAny(r.data.jobId ?? r.id);
+            return {
+              id,
+              title: map[id]?.title ?? "(Job)",
+              company: map[id]?.company ?? "",
+              score: r.data.score,
+            };
+          })
+          .filter((x) => x.title);
+      }
+
+      // fallback: latest public jobs
+      const jobs = await listPublicJobs(5);
+      return jobs.map((j) => ({ id: j.id, title: j.data.title, company: j.data.company, score: 0 }));
+    },
+    staleTime: 60_000,
+  });
+
+  const items = useMemo(() => topJobs ?? [], [topJobs]);
+
   return (
     <CommandDialog open={open} onOpenChange={onOpenChange}>
-      <CommandInput placeholder="Search jobs, companies, pages..." />
+      <CommandInput placeholder="Search pages..." />
       <CommandList>
         <CommandEmpty>No results found.</CommandEmpty>
         <CommandGroup heading="Pages">
-          <CommandItem onSelect={() => go("/")}><LayoutDashboard className="mr-2 h-4 w-4" /> Dashboard</CommandItem>
-          <CommandItem onSelect={() => go("/jobs")}><Briefcase className="mr-2 h-4 w-4" /> Jobs</CommandItem>
-          <CommandItem onSelect={() => go("/tracker")}><Search className="mr-2 h-4 w-4" /> Tracker</CommandItem>
-          <CommandItem onSelect={() => go("/resume")}><FileText className="mr-2 h-4 w-4" /> Resume</CommandItem>
-          <CommandItem onSelect={() => go("/notifications")}><Settings className="mr-2 h-4 w-4" /> Notifications</CommandItem>
+          <CommandItem onSelect={() => go("/")}>
+            <LayoutDashboard className="mr-2 h-4 w-4" /> Dashboard
+          </CommandItem>
+          <CommandItem onSelect={() => go("/jobs")}>
+            <Briefcase className="mr-2 h-4 w-4" /> Jobs
+          </CommandItem>
+          <CommandItem onSelect={() => go("/tracker")}>
+            <Search className="mr-2 h-4 w-4" /> Tracker
+          </CommandItem>
+          <CommandItem onSelect={() => go("/resume")}>
+            <FileText className="mr-2 h-4 w-4" /> Resume
+          </CommandItem>
+          <CommandItem onSelect={() => go("/notifications")}>
+            <Bell className="mr-2 h-4 w-4" /> Notifications
+          </CommandItem>
         </CommandGroup>
+
         <CommandGroup heading="Top Jobs">
-          {jobs.slice(0, 5).map((job) => (
-            <CommandItem key={job.id} onSelect={() => go("/jobs")}>
+          {items.map((job) => (
+            <CommandItem key={job.id} onSelect={() => go("/jobs")}> 
               <Briefcase className="mr-2 h-4 w-4" />
               {job.title} — {job.company}
-              <span className="ml-auto text-xs text-muted-foreground">{job.matchScore}%</span>
+              {job.score ? <span className="ml-auto text-xs text-muted-foreground">{job.score}%</span> : null}
             </CommandItem>
           ))}
         </CommandGroup>

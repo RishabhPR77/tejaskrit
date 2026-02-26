@@ -1,11 +1,12 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { Search, Bell, Command } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { ProfileDropdown } from "./ProfileDropdown";
 import { CommandPalette } from "./CommandPalette";
-import { notifications } from "@/lib/mock-data";
+import { useAuth } from "@/contexts/AuthProvider";
+import { useQuery } from "@tanstack/react-query";
+import { listUserNotifications } from "@/lib/firestore";
 
 const navItems = [
   { label: "Dashboard", path: "/" },
@@ -19,14 +20,30 @@ const navItems = [
 export function Navbar() {
   const location = useLocation();
   const [commandOpen, setCommandOpen] = useState(false);
-  const unreadCount = notifications.filter((n) => !n.read).length;
+  const { authUser } = useAuth();
+
+  const { data: notifs } = useQuery({
+    queryKey: ["notifications", authUser?.uid],
+    enabled: !!authUser?.uid,
+    queryFn: async () => {
+      if (!authUser?.uid) return [];
+      return await listUserNotifications(authUser.uid, 50);
+    },
+    staleTime: 30_000,
+  });
+
+  const unreadCount = useMemo(() => (notifs ?? []).filter((n) => !n.data.read).length, [notifs]);
 
   return (
     <>
       <header className="fixed top-0 left-0 right-0 z-50 h-14 bg-card border-b border-border">
         <div className="max-w-[1300px] mx-auto h-full px-4 sm:px-6 flex items-center gap-6">
           {/* Logo */}
-          <Link to="/" className="text-lg font-bold tracking-wide text-foreground shrink-0" style={{ letterSpacing: "0.08em" }}>
+          <Link
+            to="/"
+            className="text-lg font-bold tracking-wide text-foreground shrink-0"
+            style={{ letterSpacing: "0.08em" }}
+          >
             Tejaskrit
           </Link>
 
