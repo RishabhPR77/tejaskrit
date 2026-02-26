@@ -5,11 +5,21 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import { useAuth } from "@/contexts/AuthProvider";
 import { toast } from "@/hooks/use-toast";
-import { connectUserToInstitute, listInstitutes } from "@/lib/firestore";
-import { slugify } from "@/lib/utils";
+import { connectUserToInstituteExisting, listConfiguredInstitutes } from "@/lib/firestore";
 import type { InstituteDoc } from "@/lib/types";
+import { Check, ChevronsUpDown } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 export default function Register() {
   const navigate = useNavigate();
@@ -20,8 +30,8 @@ export default function Register() {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
 
-  const [college, setCollege] = useState("");
-  const [instituteCode, setInstituteCode] = useState("");
+  const [selectedInstituteId, setSelectedInstituteId] = useState<string>("");
+  const [selectedInstituteName, setSelectedInstituteName] = useState<string>("");
   const [branch, setBranch] = useState("");
   const [batch, setBatch] = useState("");
   const [cgpa, setCgpa] = useState("");
@@ -37,18 +47,20 @@ export default function Register() {
   }, [authUser, userDoc, loading, navigate]);
 
   useEffect(() => {
-    // Lightweight suggestions for institute field (hackathon-friendly)
     (async () => {
       try {
-        const items = await listInstitutes(50);
+        const items = await listConfiguredInstitutes(300);
         setInstitutes(items);
       } catch {
-        // ignore
+        setInstitutes([]);
       }
     })();
   }, []);
 
-  const instituteIdPreview = useMemo(() => (college.trim() ? slugify(college.trim()) : ""), [college]);
+  const selectedInstitute = useMemo(
+    () => institutes.find((i) => i.id === selectedInstituteId) ?? null,
+    [institutes, selectedInstituteId]
+  );
 
   const handleRegister = async () => {
     if (!name.trim()) {
@@ -71,8 +83,12 @@ export default function Register() {
       toast({ title: "Passwords do not match", description: "Re-check your password.", variant: "destructive" });
       return;
     }
-    if (!college.trim()) {
-      toast({ title: "College required", description: "Select or type your college/university.", variant: "destructive" });
+    if (!selectedInstituteId) {
+      toast({
+        title: "College required",
+        description: "Select your college from the list (only colleges registered by TPO are available).",
+        variant: "destructive",
+      });
       return;
     }
 
@@ -86,14 +102,13 @@ export default function Register() {
       setSubmitting(true);
       const user = await signUpEmail(email.trim(), password, name.trim());
 
-      // Connect the user to an institute immediately (so TPO dashboards & institute jobs work)
-      await connectUserToInstitute({
+      // ✅ Connect to an EXISTING TPO-configured institute (prevents duplicate institute docs)
+      await connectUserToInstituteExisting({
         uid: user.uid,
-        instituteName: college.trim(),
-        instituteCode: instituteCode.trim() || undefined,
         branch: branch.trim() || undefined,
         batch: batch.trim() || undefined,
         cgpa: cgpaNum,
+        instituteId: selectedInstituteId,
       });
 
       toast({
@@ -105,7 +120,8 @@ export default function Register() {
         state: {
           prefill: {
             name: name.trim(),
-            college: college.trim(),
+            instituteId: selectedInstituteId,
+            college: selectedInstituteName || selectedInstitute?.data?.name || "",
             branch: branch.trim(),
             batch: batch.trim(),
             cgpa: cgpa.trim(),
@@ -197,31 +213,27 @@ export default function Register() {
 
           <div className="space-y-2">
             <Label htmlFor="college">College / University</Label>
-            <Input
-              id="college"
-              list="institutes"
-              placeholder="e.g. MITS Gwalior"
-              value={college}
-              onChange={(e) => setCollege(e.target.value)}
+            <InstitutePicker
+              institutes={institutes}
+              valueId={selectedInstituteId}
+              onChange={(id, name) => {
+                setSelectedInstituteId(id);
+                setSelectedInstituteName(name);
+              }}
             />
-            <datalist id="institutes">
-              {institutes.map((i) => (
-                <option key={i.id} value={i.data.name} />
-              ))}
-            </datalist>
-            {instituteIdPreview ? (
-              <p className="text-[11px] text-muted-foreground">Institute ID: {instituteIdPreview}</p>
-            ) : null}
+            <p className="text-[11px] text-muted-foreground">
+              Only colleges with a registered TPO workspace are available.
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label htmlFor="code">Institute Code (optional)</Label>
-              <Input id="code" placeholder="e.g. MITS" value={instituteCode} onChange={(e) => setInstituteCode(e.target.value)} />
-            </div>
-            <div className="space-y-2">
               <Label htmlFor="branch">Branch (optional)</Label>
               <Input id="branch" placeholder="IT / CSE" value={branch} onChange={(e) => setBranch(e.target.value)} />
+            </div>
+            <div className="space-y-2">
+              <Label>Institute Code</Label>
+              <Input value={selectedInstitute?.data?.code ?? ""} readOnly placeholder="Auto" />
             </div>
           </div>
 
@@ -281,5 +293,65 @@ export default function Register() {
         </Card>
       </div>
     </div>
+  );
+}
+
+function InstitutePicker({
+  institutes,
+  valueId,
+  onChange,
+}: {
+  institutes: Array<{ id: string; data: InstituteDoc }>;
+  valueId: string;
+  onChange: (id: string, name: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = institutes.find((i) => i.id === valueId);
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          role="combobox"
+          className="w-full justify-between h-9"
+          type="button"
+        >
+          <span className={cn("truncate", !selected && "text-muted-foreground")}>
+            {selected ? selected.data.name : "Search and select your college"}
+          </span>
+          <ChevronsUpDown className="h-4 w-4 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
+        <Command>
+          <CommandInput placeholder="Type college name…" />
+          <CommandList>
+            <CommandEmpty>No college found. Ask your TPO to register your institute.</CommandEmpty>
+            <CommandGroup heading="Colleges">
+              {institutes.map((i) => (
+                <CommandItem
+                  key={i.id}
+                  value={`${i.data.name} ${i.data.code ?? ""}`}
+                  onSelect={() => {
+                    onChange(i.id, i.data.name);
+                    setOpen(false);
+                  }}
+                >
+                  <Check className={cn("mr-2 h-4 w-4", valueId === i.id ? "opacity-100" : "opacity-0")} />
+                  <div className="min-w-0">
+                    <div className="text-sm truncate">{i.data.name}</div>
+                    <div className="text-[11px] text-muted-foreground truncate">
+                      {i.data.code ? `Code: ${i.data.code}` : ""}
+                      {i.data.domainsAllowed?.length ? ` · Domains: ${i.data.domainsAllowed.slice(0, 2).join(", ")}` : ""}
+                    </div>
+                  </div>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
   );
 }

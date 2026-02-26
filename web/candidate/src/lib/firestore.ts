@@ -4,6 +4,7 @@
 
 import {
   collection,
+  collectionGroup,
   doc,
   deleteDoc,
   getDoc,
@@ -32,7 +33,7 @@ import type {
   RecommendationDoc,
   UserDoc,
 } from "./types";
-import { slugify } from "./utils";
+// slugify previously used for institute doc IDs; now institutes are owned by TPO.
 
 // ---------------------------
 // Helpers
@@ -156,45 +157,74 @@ export async function saveUserConsents(uid: string, consents: UserDoc["consents"
 // Institute connection
 // ---------------------------
 
-export async function listInstitutes(take = 50): Promise<Array<{ id: string; data: InstituteDoc }>> {
-  const q = query(collection(db, "institutes"), limit(take));
-  const snap = await getDocs(q);
-  const rows = snap.docs.map((d) => ({ id: d.id, data: d.data() as InstituteDoc }));
+/**
+ * ✅ Candidate-side institute picker
+ * Only show colleges that have a configured TPO.
+ * Primary: institutes where hasTpo == true
+ * Fallback (legacy): infer institutes via collectionGroup members where role == 'tpo'.
+ */
+export async function listConfiguredInstitutes(take = 200): Promise<Array<{ id: string; data: InstituteDoc }>> {
+  // 1) Prefer explicit flags
+  try {
+    const q1 = query(collection(db, "institutes"), where("hasTpo", "==", true), limit(take));
+    const snap1 = await getDocs(q1);
+    const rows1 = snap1.docs
+      .map((d) => ({ id: d.id, data: d.data() as InstituteDoc }))
+      .filter((r) => (r.data.isActive ?? true) && (r.data.isConfigured ?? true));
+    if (rows1.length > 0) return rows1.sort((a, b) => (a.data.name ?? "").localeCompare(b.data.name ?? ""));
+  } catch {
+    // ignore and fallback
+  }
+
+  // 2) Legacy fallback: institutes that have at least one TPO member
+  const q2 = query(collectionGroup(db, "members"), where("role", "==", "tpo"), limit(take));
+  const snap2 = await getDocs(q2);
+  const instituteIds = Array.from(
+    new Set(
+      snap2.docs
+        .map((d) => d.ref.path.split("/")?.[1]) // institutes/{instituteId}/members/{uid}
+        .filter(Boolean)
+    )
+  );
+
+  const rows: Array<{ id: string; data: InstituteDoc }> = [];
+  await Promise.all(
+    instituteIds.map(async (id) => {
+      const s = await getDoc(doc(db, "institutes", id));
+      if (s.exists()) {
+        const data = s.data() as InstituteDoc;
+        if ((data.isActive ?? true) && (data.domainsAllowed?.length ?? 0) > 0) rows.push({ id, data });
+      }
+    })
+  );
   return rows.sort((a, b) => (a.data.name ?? "").localeCompare(b.data.name ?? ""));
 }
 
-export async function connectUserToInstitute(args: {
+export async function getInstituteById(instituteId: string): Promise<InstituteDoc | null> {
+  const snap = await getDoc(doc(db, "institutes", instituteId));
+  return snap.exists() ? (snap.data() as InstituteDoc) : null;
+}
+
+/**
+ * ✅ Connect a candidate to an existing institute (prevents duplicate institute docs).
+ */
+export async function connectUserToInstituteExisting(args: {
   uid: string;
-  instituteName: string;
-  instituteCode?: string;
+  instituteId: string;
   branch?: string;
   batch?: string;
   cgpa?: number;
 }) {
-  const { uid, instituteName, instituteCode, branch, batch: batchYear, cgpa } = args;
-  const name = (instituteName ?? "").trim();
-  if (!name) throw new Error("Institute name is required");
+  const { uid, instituteId, branch, batch: batchYear, cgpa } = args;
+  if (!instituteId) throw new Error("Select your institute");
 
-  const instituteId = slugify(name);
-  if (!instituteId) throw new Error("Invalid institute name");
+  const inst = await getInstituteById(instituteId);
+  if (!inst) throw new Error("Selected institute not found. Ask your TPO to register it first.");
 
   const userRef = doc(db, "users", uid);
-  const instRef = doc(db, "institutes", instituteId);
   const memRef = doc(db, "institutes", instituteId, "members", uid);
 
   const batch = writeBatch(db);
-  batch.set(
-    instRef,
-    stripUndefinedDeep({
-      name,
-      code: instituteCode?.trim() ? instituteCode.trim().toUpperCase() : undefined,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    }),
-    { merge: true }
-  );
-
   batch.set(
     memRef,
     {
@@ -208,7 +238,6 @@ export async function connectUserToInstitute(args: {
     },
     { merge: true }
   );
-
   batch.set(
     userRef,
     {
@@ -218,7 +247,6 @@ export async function connectUserToInstitute(args: {
     },
     { merge: true }
   );
-
   await batch.commit();
   return instituteId;
 }
@@ -253,21 +281,8 @@ export async function saveOnboarding(
 
   if (instituteMember?.instituteId) {
     const instituteId = instituteMember.instituteId;
-    const instRef = doc(db, "institutes", instituteId);
-    const instituteName =
-      instituteMember.instituteName?.trim() || profilePatch?.education?.[0]?.institute?.trim() || instituteId;
-
-    batch.set(
-      instRef,
-      stripUndefinedDeep({
-        name: instituteName,
-        isActive: true,
-        updatedAt: serverTimestamp(),
-        createdAt: serverTimestamp(),
-      }),
-      { merge: true }
-    );
-
+    // IMPORTANT: Candidate flow should NOT create/overwrite institute docs.
+    // Institutes are owned/configured by TPO panel.
     const memRef = doc(db, "institutes", instituteId, "members", uid);
     batch.set(
       memRef,

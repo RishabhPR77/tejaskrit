@@ -7,11 +7,21 @@ import { Card } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
-import { Check, ArrowRight, ArrowLeft, X } from "lucide-react";
+import { Check, ArrowRight, ArrowLeft, X, ChevronsUpDown } from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
 import { useAuth } from "@/contexts/AuthProvider";
-import { saveOnboarding } from "@/lib/firestore";
+import { listConfiguredInstitutes, saveOnboarding } from "@/lib/firestore";
 import { toast } from "@/hooks/use-toast";
-import { slugify } from "@/lib/utils";
+import type { InstituteDoc } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 const steps = ["Basic Info", "Education", "Links", "Skills & Summary", "Review"]; 
 
@@ -27,6 +37,8 @@ export default function Onboarding() {
     name: "",
     phone: "",
     location: "",
+
+    instituteId: "",
 
     college: "",
     branch: "",
@@ -54,6 +66,7 @@ export default function Onboarding() {
       setForm((p) => ({
         ...p,
         name: prefill.name ?? p.name,
+        instituteId: prefill.instituteId ?? p.instituteId,
         college: prefill.college ?? p.college,
         branch: prefill.branch ?? p.branch,
         batch: prefill.batch ?? p.batch,
@@ -67,6 +80,7 @@ export default function Onboarding() {
       name: p.name || userDoc?.name || authUser?.displayName || "",
       phone: p.phone || userDoc?.phone || "",
       location: p.location || "",
+      instituteId: p.instituteId || userDoc?.instituteId || "",
     }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userDoc?.onboardedAt]);
@@ -84,14 +98,35 @@ export default function Onboarding() {
 
   const progress = useMemo(() => ((step + 1) / steps.length) * 100, [step]);
 
-  const instituteId = useMemo(() => {
-    const c = form.college.trim();
-    return c ? slugify(c) : null;
-  }, [form.college]);
+  const [institutes, setInstitutes] = useState<Array<{ id: string; data: InstituteDoc }>>([]);
+  const [instPickerOpen, setInstPickerOpen] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const rows = await listConfiguredInstitutes(300);
+        setInstitutes(rows);
+
+        // If we have instituteId but not college name, fill it
+        if (form.instituteId && !form.college) {
+          const found = rows.find((r) => r.id === form.instituteId);
+          if (found) setForm((p) => ({ ...p, college: found.data.name }));
+        }
+      } catch {
+        setInstitutes([]);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const selectedInstitute = useMemo(
+    () => institutes.find((i) => i.id === form.instituteId) ?? null,
+    [institutes, form.instituteId]
+  );
 
   const validate = () => {
     if (!form.name.trim()) return "Name is required";
-    if (!form.college.trim()) return "College/University is required";
+    if (!form.instituteId) return "Select your college/institute";
     if (form.skills.length === 0) return "Add at least 1 skill";
     return null;
   };
@@ -115,7 +150,7 @@ export default function Onboarding() {
           uid,
           name: form.name.trim(),
           phone: form.phone.trim(),
-          instituteId,
+          instituteId: form.instituteId,
           role: "student",
           prefs: {
             locations: form.location ? [form.location] : [],
@@ -131,7 +166,7 @@ export default function Onboarding() {
           skills: form.skills,
           education: [
             {
-              institute: form.college.trim(),
+              institute: (form.college || selectedInstitute?.data.name || "").trim(),
               degree: "",
               branch: form.branch.trim() || undefined,
               startYear: undefined,
@@ -141,8 +176,8 @@ export default function Onboarding() {
           ],
         },
         {
-          instituteId,
-          instituteName: form.college.trim(),
+          instituteId: form.instituteId,
+          instituteName: (form.college || selectedInstitute?.data.name || "").trim(),
           branch: form.branch.trim(),
           batch: form.batch.trim(),
           cgpa: form.cgpa ? Number(form.cgpa) : undefined,
@@ -212,10 +247,55 @@ export default function Onboarding() {
             <div className="space-y-4">
               <div>
                 <Label>College / University</Label>
-                <Input placeholder="MITS Gwalior" value={form.college} onChange={(e) => set("college", e.target.value)} />
-                {instituteId ? (
-                  <p className="text-[11px] text-muted-foreground mt-1">Institute ID: {instituteId}</p>
-                ) : null}
+                <Popover open={instPickerOpen} onOpenChange={setInstPickerOpen}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      role="combobox"
+                      className="w-full justify-between h-9"
+                    >
+                      <span className={cn("truncate", !selectedInstitute && "text-muted-foreground")}>
+                        {selectedInstitute ? selectedInstitute.data.name : "Search and select your college"}
+                      </span>
+                      <ChevronsUpDown className="h-4 w-4 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
+                    <Command>
+                      <CommandInput placeholder="Type college name…" />
+                      <CommandList>
+                        <CommandEmpty>
+                          No college found. Ask your TPO to register your institute first.
+                        </CommandEmpty>
+                        <CommandGroup heading="Colleges">
+                          {institutes.map((i) => (
+                            <CommandItem
+                              key={i.id}
+                              value={`${i.data.name} ${i.data.code ?? ""}`}
+                              onSelect={() => {
+                                setForm((p) => ({ ...p, instituteId: i.id, college: i.data.name }));
+                                setInstPickerOpen(false);
+                              }}
+                            >
+                              <Check className={cn("mr-2 h-4 w-4", form.instituteId === i.id ? "opacity-100" : "opacity-0")} />
+                              <div className="min-w-0">
+                                <div className="text-sm truncate">{i.data.name}</div>
+                                <div className="text-[11px] text-muted-foreground truncate">
+                                  {i.data.code ? `Code: ${i.data.code}` : ""}
+                                  {i.data.domainsAllowed?.length ? ` · Domains: ${i.data.domainsAllowed.slice(0, 2).join(", ")}` : ""}
+                                </div>
+                              </div>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  Only colleges with a registered TPO workspace are available.
+                </p>
               </div>
               <div>
                 <Label>Branch / Major</Label>

@@ -9,7 +9,7 @@ import {
   type User,
 } from "firebase/auth";
 import { doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
-import { upsertInstituteAndMakeTpo } from "@/lib/firestore";
+import { ensureInstituteConfiguredForTpo, upsertInstituteAndMakeTpo } from "@/lib/firestore";
 import type { UserDoc, UserRole } from "@/lib/types";
 
 export type AppRole = UserRole;
@@ -102,6 +102,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setLoading(true);
       const p = await ensureUserDoc(u);
       setProfile(p);
+
+       // ✅ Backfill institute flags so Candidate picker can list this institute
+       if (p.role === "tpo" && p.instituteId) {
+         try {
+           await ensureInstituteConfiguredForTpo(p.instituteId);
+         } catch {
+           // ignore
+         }
+       }
+
       setLoading(false);
     });
     return () => unsub();

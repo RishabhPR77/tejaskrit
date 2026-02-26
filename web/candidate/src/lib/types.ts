@@ -174,6 +174,10 @@ export interface InstituteDoc {
   name: string;
   code?: string;
   domainsAllowed?: string[];
+  // ✅ only institutes with configured TPO should be selectable by candidates
+  hasTpo?: boolean;
+  isConfigured?: boolean;
+  tpoConfiguredAt?: Timestamp;
   isActive?: boolean;
   createdAt?: Timestamp;
   updatedAt?: Timestamp;

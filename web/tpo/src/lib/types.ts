@@ -20,6 +20,10 @@ export interface InstituteDoc {
   name: string;
   code?: string;
   domainsAllowed?: string[];
+  // ✅ for Candidate-side institute picker: only show institutes that have an onboarded TPO
+  hasTpo?: boolean;
+  isConfigured?: boolean;
+  tpoConfiguredAt?: Timestamp;
   isActive?: boolean;
   createdAt?: Timestamp;
   createdBy?: string;

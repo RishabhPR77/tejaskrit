@@ -115,6 +115,10 @@ export async function upsertInstituteAndMakeTpo(args: {
     name: instituteName,
     code: codeUpper || undefined,
     domainsAllowed: args.domainsAllowed.map((d) => d.trim().toLowerCase()).filter(Boolean),
+    // ✅ Candidate app will only allow colleges that have a configured TPO
+    hasTpo: true,
+    isConfigured: true,
+    tpoConfiguredAt: serverTimestamp() as any,
     isActive: true,
     createdBy: args.uid,
     updatedAt: serverTimestamp() as any,
@@ -150,6 +154,25 @@ export async function upsertInstituteAndMakeTpo(args: {
 export function watchInstitute(instituteId: string, cb: (inst: InstituteDoc | null) => void) {
   const ref = doc(db, "institutes", instituteId);
   return onSnapshot(ref, (snap) => cb(snap.exists() ? (snap.data() as InstituteDoc) : null));
+}
+
+/**
+ * One-time safety patch:
+ * Older institute docs might not have hasTpo/isConfigured flags. We set them here so
+ * Candidate-side institute picker can list this institute.
+ */
+export async function ensureInstituteConfiguredForTpo(instituteId: string) {
+  const ref = doc(db, "institutes", instituteId);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return;
+  const data = snap.data() as InstituteDoc;
+  if (data.hasTpo && data.isConfigured) return;
+  await updateDoc(ref, stripUndefinedDeep({
+    hasTpo: true,
+    isConfigured: true,
+    tpoConfiguredAt: serverTimestamp() as any,
+    updatedAt: serverTimestamp() as any,
+  }) as any);
 }
 
 export function watchInstituteMembers(
