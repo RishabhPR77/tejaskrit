@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getAdminDb } from "../_lib/firebaseAdmin";
-import { requireUser } from "../_lib/auth";
-import { signLatexUrl } from "../_lib/util";
+import { getAdminDb } from "../_lib/firebaseAdmin.js";
+import { requireUser } from "../_lib/auth.js";
+import { signLatexUrl } from "../_lib/util.js";
 
 function bad(res: VercelResponse, status: number, msg: string) {
   return res.status(status).json({ ok: false, error: msg });

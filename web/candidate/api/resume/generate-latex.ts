@@ -1,8 +1,8 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getAdminDb } from "../_lib/firebaseAdmin";
-import { requireUser } from "../_lib/auth";
-import { stripUndefinedDeep } from "../_lib/util";
-import { groqChat } from "../_lib/groq";
+import { getAdminDb } from "../_lib/firebaseAdmin.js";
+import { requireUser } from "../_lib/auth.js";
+import { stripUndefinedDeep } from "../_lib/util.js";
+import { groqChat } from "../_lib/groq.js";
 
 type Body = {
   jobId: string;

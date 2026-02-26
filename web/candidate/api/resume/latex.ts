@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getAdminDb } from "../_lib/firebaseAdmin";
-import { getBearerToken, requireUser } from "../_lib/auth";
-import { verifyLatexUrlSig } from "../_lib/util";
+import { getAdminDb } from "../_lib/firebaseAdmin.js";
+import { getBearerToken, requireUser } from "../_lib/auth.js";
+import { verifyLatexUrlSig } from "../_lib/util.js";
 
 function bad(res: VercelResponse, status: number, msg: string) {
   return res.status(status).send(msg);
