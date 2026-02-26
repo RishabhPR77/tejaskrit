@@ -1,47 +1,32 @@
-import React, {
-  createContext,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-} from "react";
+import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import { auth, db } from "@/lib/firebase";
 import {
   onAuthStateChanged,
   signOut,
-  signInAnonymously,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   updateProfile,
   type User,
 } from "firebase/auth";
-import {
-  collection,
-  doc,
-  getDoc,
-  serverTimestamp,
-  setDoc,
-  updateDoc,
-} from "firebase/firestore";
+import { doc, getDoc, serverTimestamp, setDoc, updateDoc } from "firebase/firestore";
+import { upsertInstituteAndMakeTpo } from "@/lib/firestore";
+import type { UserDoc, UserRole } from "@/lib/types";
 
-export type AppRole = "tpo" | "student" | "admin" | "pending_tpo";
+export type AppRole = UserRole;
 
 export type UserProfile = {
   uid: string;
   email?: string | null;
-  displayEmail?: string | null; // used for demo/anonymous logins
   name?: string | null;
   photoUrl?: string | null;
   role: AppRole;
   instituteId?: string | null;
-  createdAt?: any;
-  updatedAt?: any;
 };
 
 type RegisterCollegeInput = {
   instituteName: string;
   instituteCode?: string;
-  allowedDomains: string[]; // ["mitsgwalior.in"]
+  domainsAllowed: string[]; // ["mitsgwalior.in"]
 };
 
 type RegisterAccountInput = {
@@ -57,10 +42,6 @@ type AuthContextValue = {
 
   loginWithEmailPassword: (email: string, password: string) => Promise<void>;
   registerWithEmailPassword: (input: RegisterAccountInput) => Promise<void>;
-
-  // optional demo mode (anonymous). If you don’t want it, you can remove from UI.
-  loginDemoCollege: () => Promise<void>;
-
   logout: () => Promise<void>;
 
   registerCollege: (input: RegisterCollegeInput) => Promise<string>; // returns instituteId
@@ -73,29 +54,35 @@ async function ensureUserDoc(u: User): Promise<UserProfile> {
   const snap = await getDoc(ref);
 
   if (!snap.exists()) {
-    const profile: UserProfile = {
+    const profile: UserDoc = {
       uid: u.uid,
       email: u.email,
       name: u.displayName,
       photoUrl: u.photoURL,
-      role: "pending_tpo",
+      role: "tpo",
       instituteId: null,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
+      createdAt: serverTimestamp() as any,
+      updatedAt: serverTimestamp() as any,
     };
-    await setDoc(ref, profile, { merge: true });
-    return profile;
+    await setDoc(ref, profile as any, { merge: true });
+    return {
+      uid: u.uid,
+      email: u.email,
+      name: u.displayName,
+      photoUrl: u.photoURL,
+      role: "tpo",
+      instituteId: null,
+    };
   }
 
-  const data = snap.data() as UserProfile;
+  const data = snap.data() as UserDoc;
   return {
     uid: u.uid,
     email: u.email ?? data.email,
-    name: u.displayName ?? data.name,
-    photoUrl: u.photoURL ?? data.photoUrl,
-    role: data.role ?? "pending_tpo",
+    name: u.displayName ?? (data.name ?? null),
+    photoUrl: u.photoURL ?? (data.photoUrl ?? null),
+    role: (data.role ?? "tpo") as AppRole,
     instituteId: data.instituteId ?? null,
-    displayEmail: data.displayEmail ?? null,
   };
 }
 
@@ -130,69 +117,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const name = input.name.trim();
 
     const cred = await createUserWithEmailAndPassword(auth, email, password);
-
-    // Set display name for UI
     if (name) {
       await updateProfile(cred.user, { displayName: name });
     }
 
-    // Ensure user doc exists immediately
     const p = await ensureUserDoc(cred.user);
     setProfile(p);
-  };
-
-  // Optional demo: requires enabling Anonymous provider in Firebase Auth.
-  const loginDemoCollege = async () => {
-    const cred = await signInAnonymously(auth);
-    const u = cred.user;
-
-    const demoInstituteId = "demo-institute";
-    const instituteRef = doc(db, "institutes", demoInstituteId);
-
-    await setDoc(
-      instituteRef,
-      {
-        name: "Demo Institute",
-        code: "DEMO",
-        allowedDomains: ["demo.edu"],
-        createdAt: serverTimestamp(),
-        createdBy: u.uid,
-        isActive: true,
-      },
-      { merge: true },
-    );
-
-    await setDoc(
-      doc(db, "institutes", demoInstituteId, "members", u.uid),
-      {
-        uid: u.uid,
-        role: "tpo",
-        status: "active",
-        joinedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-
-    await setDoc(
-      doc(db, "users", u.uid),
-      {
-        uid: u.uid,
-        role: "tpo",
-        instituteId: demoInstituteId,
-        displayEmail: "tpo@demo.edu",
-        name: "Demo TPO",
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true },
-    );
-
-    setProfile({
-      uid: u.uid,
-      role: "tpo",
-      instituteId: demoInstituteId,
-      displayEmail: "tpo@demo.edu",
-      name: "Demo TPO",
-    });
   };
 
   const logout = async () => {
@@ -202,27 +132,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const registerCollege = async (input: RegisterCollegeInput) => {
     if (!user) throw new Error("Not logged in");
 
-    const instituteDoc = doc(collection(db, "institutes"));
-    const instituteId = instituteDoc.id;
-
-    await setDoc(instituteDoc, {
-      name: input.instituteName.trim(),
-      code: (input.instituteCode ?? "").trim() || null,
-      allowedDomains: input.allowedDomains
-        .map((d) => d.trim().toLowerCase())
-        .filter(Boolean),
-      createdAt: serverTimestamp(),
-      createdBy: user.uid,
-      isActive: true,
-    });
-
-    await setDoc(doc(db, "institutes", instituteId, "members", user.uid), {
+    const instituteId = await upsertInstituteAndMakeTpo({
       uid: user.uid,
-      role: "tpo",
-      status: "active",
-      joinedAt: serverTimestamp(),
+      instituteName: input.instituteName,
+      instituteCode: input.instituteCode,
+      domainsAllowed: input.domainsAllowed,
     });
 
+    // Keep /users doc synced with current auth profile details
     await updateDoc(doc(db, "users", user.uid), {
       role: "tpo",
       instituteId,
@@ -230,12 +147,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       email: user.email ?? null,
       name: user.displayName ?? null,
       photoUrl: user.photoURL ?? null,
-    });
+    } as any);
 
     setProfile((prev) =>
-      prev
-        ? { ...prev, role: "tpo", instituteId }
-        : { uid: user.uid, role: "tpo", instituteId },
+      prev ? { ...prev, role: "tpo", instituteId } : { uid: user.uid, role: "tpo", instituteId },
     );
 
     return instituteId;
@@ -248,7 +163,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       loading,
       loginWithEmailPassword,
       registerWithEmailPassword,
-      loginDemoCollege,
       logout,
       registerCollege,
     }),

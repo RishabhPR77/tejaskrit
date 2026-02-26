@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, X, StickyNote, Plus, Loader2, Save } from "lucide-react";
+import { Search, StickyNote, Loader2, Save } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { StatusBadge } from "@/components/StatusBadge";
-import { branches, batches, placementStatuses } from "@/lib/mock-data";
+import { branches, placementStatuses } from "@/lib/mock-data";
 import {
   Select,
   SelectContent,
@@ -24,67 +24,33 @@ import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 
 import { useAuth } from "@/auth/AuthProvider";
-import { db } from "@/lib/firebase";
+import type { ApplicationDoc, InstituteMemberDoc, UserDoc } from "@/lib/types";
 import {
-  addDoc,
-  collection,
-  doc,
-  onSnapshot,
-  query,
-  serverTimestamp,
-  updateDoc,
-  where,
-  Timestamp,
-} from "firebase/firestore";
+  getUsersByIds,
+  watchInstituteApplications,
+  watchInstituteMembers,
+} from "@/lib/firestore";
+import { doc, updateDoc } from "firebase/firestore";
+import { db } from "@/lib/firebase";
 
-type StudentDoc = {
-  instituteId: string;
-  createdAt?: any;
-  updatedAt?: any;
-
+type StudentRow = {
+  uid: string;
   name: string;
   email?: string | null;
-  rollNo?: string | null;
-
   branch: string;
   batch: string;
-  cgpa: number;
-
-  status: string; // Placed / In Process / Unplaced / Not Started
-  notes?: string | null;
+  cgpa?: number | null;
+  status: string;
+  notes?: string;
+  applications: number;
+  offers: number;
 };
 
-type Student = StudentDoc & { id: string };
-
-type AppDoc = {
-  instituteId: string;
-  createdAt?: any;
-  updatedAt?: any;
-
-  studentId: string;
-  studentName: string;
-
-  company: string;
-  role: string;
-
-  status: string; // Applied/OA/Interview/Offer/Rejected/Joined
-  appliedAt?: Timestamp | null;
-
-  nextEventLabel?: string | null;
-  nextEventAt?: Timestamp | null;
-
-  outcome?: string | null;
-};
-
-type Application = AppDoc & { id: string };
-
-function fmtDate(d: Date | null) {
-  if (!d) return "—";
-  return d.toLocaleDateString("en-IN", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
+function statusFromApps(apps: ApplicationDoc[]) {
+  const s = new Set(apps.map((a) => a.status));
+  if (s.has("joined") || s.has("offer")) return "Placed";
+  if (apps.length > 0) return "In Process";
+  return "Not Started";
 }
 
 export default function Students() {
@@ -93,242 +59,113 @@ export default function Students() {
   const instituteId = profile?.instituteId ?? null;
 
   const [loading, setLoading] = useState(true);
-  const [students, setStudents] = useState<Student[]>([]);
-  const [apps, setApps] = useState<Application[]>([]);
+  const [members, setMembers] = useState<Array<{ id: string; data: InstituteMemberDoc }>>([]);
+  const [apps, setApps] = useState<Array<{ id: string; data: ApplicationDoc }>>([]);
+  const [users, setUsers] = useState<Map<string, UserDoc>>(new Map());
 
   const [search, setSearch] = useState("");
   const [branchFilter, setBranchFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("all");
 
-  const [selectedStudentId, setSelectedStudentId] = useState<string | null>(
-    null,
-  );
-
-  // Add student dialog
-  const [addOpen, setAddOpen] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [form, setForm] = useState({
-    name: "",
-    email: "",
-    rollNo: "",
-    branch: "CSE",
-    batch: "2026",
-    cgpa: "8.0",
-    status: "Not Started",
-    notes: "",
-  });
-
-  // Notes editing
+  const [selectedUid, setSelectedUid] = useState<string | null>(null);
   const [notesDraft, setNotesDraft] = useState("");
   const [notesSaving, setNotesSaving] = useState(false);
 
-  // realtime students
   useEffect(() => {
     if (!instituteId) return;
-
     setLoading(true);
-    const q = query(
-      collection(db, "students"),
-      where("instituteId", "==", instituteId),
-    );
 
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const list: Student[] = snap.docs.map((d) => ({
-          id: d.id,
-          ...(d.data() as StudentDoc),
-        }));
+    const unsubMembers = watchInstituteMembers(instituteId, (rows) => {
+      setMembers(rows);
+      setLoading(false);
+    });
 
-        // sort by name
-        list.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
-        setStudents(list);
-        setLoading(false);
-      },
-      (err) => {
-        console.error(err);
-        setLoading(false);
-        toast({
-          title: "Failed to load students",
-          description: err?.message ?? "Check Firestore setup.",
-          variant: "destructive",
-        });
-      },
-    );
+    const unsubApps = watchInstituteApplications(instituteId, (rows) => {
+      setApps(rows);
+    });
 
-    return () => unsub();
-  }, [instituteId, toast]);
-
-  // realtime applications (only for counts + pipeline + upcoming)
-  useEffect(() => {
-    if (!instituteId) return;
-
-    const q = query(
-      collection(db, "applications"),
-      where("instituteId", "==", instituteId),
-    );
-
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const list: Application[] = snap.docs.map((d) => ({
-          id: d.id,
-          ...(d.data() as AppDoc),
-        }));
-        setApps(list);
-      },
-      (err) => {
-        console.error(err);
-      },
-    );
-
-    return () => unsub();
+    return () => {
+      unsubMembers();
+      unsubApps();
+    };
   }, [instituteId]);
 
-  const countsByStudent = useMemo(() => {
-    const map = new Map<string, { applications: number; offers: number }>();
+  // fetch user docs for members (names/emails)
+  useEffect(() => {
+    if (!members.length) return;
+    const uids = members.map((m) => m.id);
+    (async () => {
+      const map = await getUsersByIds(uids);
+      setUsers(map);
+    })().catch(() => {});
+  }, [members]);
+
+  const appsByUser = useMemo(() => {
+    const m = new Map<string, ApplicationDoc[]>();
     for (const a of apps) {
-      const key = a.studentId;
-      const prev = map.get(key) ?? { applications: 0, offers: 0 };
-      prev.applications += 1;
-      if (a.status === "Offer" || a.status === "Joined") prev.offers += 1;
-      map.set(key, prev);
+      const uid = a.data.userId;
+      const arr = m.get(uid) ?? [];
+      arr.push(a.data);
+      m.set(uid, arr);
     }
-    return map;
+    return m;
   }, [apps]);
+
+  const rows = useMemo<StudentRow[]>(() => {
+    const out: StudentRow[] = [];
+
+    for (const m of members) {
+      if (m.data.role !== "student") continue;
+
+      const u = users.get(m.id);
+      const stApps = appsByUser.get(m.id) ?? [];
+
+      const applications = stApps.length;
+      const offers = stApps.filter((a) => a.status === "offer" || a.status === "joined").length;
+
+      out.push({
+        uid: m.id,
+        name: (u?.name as string) || "(Unnamed)",
+        email: u?.email ?? null,
+        branch: m.data.branch ?? "",
+        batch: m.data.batch ?? "",
+        cgpa: m.data.cgpa ?? null,
+        status: statusFromApps(stApps),
+        notes: m.data.tpoNotes ?? "",
+        applications,
+        offers,
+      });
+    }
+
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return out;
+  }, [members, users, appsByUser]);
 
   const filtered = useMemo(() => {
     const s = search.trim().toLowerCase();
-    return students.filter((st) => {
-      const matchSearch = !s || st.name.toLowerCase().includes(s);
+    return rows.filter((st) => {
+      const matchSearch = !s || st.name.toLowerCase().includes(s) || (st.email ?? "").toLowerCase().includes(s);
       const matchBranch = branchFilter === "all" || st.branch === branchFilter;
       const matchStatus = statusFilter === "all" || st.status === statusFilter;
       return matchSearch && matchBranch && matchStatus;
     });
-  }, [students, search, branchFilter, statusFilter]);
+  }, [rows, search, branchFilter, statusFilter]);
 
-  const student = useMemo(() => {
-    if (!selectedStudentId) return null;
-    return students.find((s) => s.id === selectedStudentId) ?? null;
-  }, [selectedStudentId, students]);
+  const selected = useMemo(() => (selectedUid ? rows.find((r) => r.uid === selectedUid) ?? null : null), [selectedUid, rows]);
 
-  const studentApps = useMemo(() => {
-    if (!student) return [];
-    const list = apps.filter((a) => a.studentId === student.id);
-    // sort by updatedAt or createdAt desc
-    list.sort((a, b) => {
-      const ams =
-        a.updatedAt?.toDate?.()?.getTime?.() ??
-        a.createdAt?.toDate?.()?.getTime?.() ??
-        0;
-      const bms =
-        b.updatedAt?.toDate?.()?.getTime?.() ??
-        b.createdAt?.toDate?.()?.getTime?.() ??
-        0;
-      return bms - ams;
-    });
-    return list;
-  }, [apps, student]);
-
-  const upcoming = useMemo(() => {
-    if (!student) return [];
-    const now = Date.now();
-    return studentApps
-      .filter((a) => a.nextEventAt?.toDate?.())
-      .map((a) => ({
-        id: a.id,
-        label: a.nextEventLabel ?? "Next event",
-        date: a.nextEventAt?.toDate?.() ?? null,
-        company: a.company,
-        role: a.role,
-      }))
-      .filter((e) => (e.date?.getTime?.() ?? 0) >= now)
-      .sort((a, b) => (a.date?.getTime?.() ?? 0) - (b.date?.getTime?.() ?? 0))
-      .slice(0, 6);
-  }, [student, studentApps]);
-
-  // keep notes draft in sync when panel opens
   useEffect(() => {
-    if (!student) return;
-    setNotesDraft(student.notes ?? "");
-  }, [student?.id]);
-
-  const resetForm = () => {
-    setForm({
-      name: "",
-      email: "",
-      rollNo: "",
-      branch: "CSE",
-      batch: "2026",
-      cgpa: "8.0",
-      status: "Not Started",
-      notes: "",
-    });
-  };
-
-  const createStudent = async () => {
-    if (!instituteId) return;
-
-    const name = form.name.trim();
-    if (!name) {
-      toast({ title: "Name required", variant: "destructive" });
-      return;
-    }
-
-    const cgpaNum = Number.parseFloat(form.cgpa);
-    if (Number.isNaN(cgpaNum) || cgpaNum < 0 || cgpaNum > 10) {
-      toast({ title: "Invalid CGPA (0–10)", variant: "destructive" });
-      return;
-    }
-
-    setSaving(true);
-    try {
-      const payload: StudentDoc = {
-        instituteId,
-        name,
-        email: form.email.trim() || null,
-        rollNo: form.rollNo.trim() || null,
-        branch: form.branch,
-        batch: form.batch,
-        cgpa: cgpaNum,
-        status: form.status,
-        notes: form.notes.trim() || null,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      };
-
-      await addDoc(collection(db, "students"), payload);
-
-      toast({ title: "Student added", description: "Saved to Firestore." });
-      setAddOpen(false);
-      resetForm();
-    } catch (e: any) {
-      console.error(e);
-      toast({
-        title: "Failed to add student",
-        description: e?.message ?? "Check Firestore setup.",
-        variant: "destructive",
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
+    if (!selected) return;
+    setNotesDraft(selected.notes ?? "");
+  }, [selected]);
 
   const saveNotes = async () => {
-    if (!student) return;
+    if (!instituteId || !selected) return;
     setNotesSaving(true);
     try {
-      await updateDoc(doc(db, "students", student.id), {
-        notes: notesDraft,
-        updatedAt: serverTimestamp(),
-      });
-      toast({ title: "Notes saved" });
+      await updateDoc(doc(db, "institutes", instituteId, "members", selected.uid), { tpoNotes: notesDraft } as any);
+      toast({ title: "Saved", description: "Notes updated" });
     } catch (e: any) {
-      toast({
-        title: "Failed to save notes",
-        description: e?.message ?? "Try again.",
-        variant: "destructive",
-      });
+      toast({ title: "Failed", description: e?.message ?? "Could not save notes", variant: "destructive" });
     } finally {
       setNotesSaving(false);
     }
@@ -339,40 +176,22 @@ export default function Students() {
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Students</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            Student directory & placement tracking (Firestore)
-          </p>
+          <p className="text-sm text-muted-foreground mt-1">Pulled from /institutes/{{instituteId}}/members</p>
         </div>
-
-        <Button
-          size="sm"
-          onClick={() => {
-            resetForm();
-            setAddOpen(true);
-          }}
-        >
-          <Plus className="w-4 h-4 mr-1.5" /> Add Student
-        </Button>
       </div>
 
-      {/* Filters */}
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="relative flex-1 max-w-sm">
+      <div className="flex flex-col md:flex-row md:items-center gap-3">
+        <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input
-            placeholder="Search students..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="pl-9"
-          />
+          <Input placeholder="Search students..." value={search} onChange={(e) => setSearch(e.target.value)} className="pl-9" />
         </div>
 
         <Select value={branchFilter} onValueChange={setBranchFilter}>
-          <SelectTrigger className="w-[130px]">
+          <SelectTrigger className="w-full md:w-48">
             <SelectValue placeholder="Branch" />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All Branches</SelectItem>
+            <SelectItem value="all">All branches</SelectItem>
             {branches.map((b) => (
               <SelectItem key={b} value={b}>
                 {b}
@@ -382,11 +201,11 @@ export default function Students() {
         </Select>
 
         <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger className="w-[160px]">
+          <SelectTrigger className="w-full md:w-48">
             <SelectValue placeholder="Status" />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All Statuses</SelectItem>
+            <SelectItem value="all">All</SelectItem>
             {placementStatuses.map((s) => (
               <SelectItem key={s} value={s}>
                 {s}
@@ -396,32 +215,21 @@ export default function Students() {
         </Select>
       </div>
 
-      {/* Table */}
       <div className="bg-card rounded-xl card-shadow border border-border overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead>
               <tr className="border-b border-border bg-secondary/40">
-                {[
-                  "Name",
-                  "Branch",
-                  "Batch",
-                  "CGPA",
-                  "Status",
-                  "Applications",
-                  "Offers",
-                  "Actions",
-                ].map((h) => (
-                  <th
-                    key={h}
-                    className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5"
-                  >
-                    {h}
-                  </th>
-                ))}
+                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">Student</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">Branch</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">Batch</th>
+                <th className="text-center text-xs font-semibold text-muted-foreground px-5 py-3.5">CGPA</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">Status</th>
+                <th className="text-center text-xs font-semibold text-muted-foreground px-5 py-3.5">Apps</th>
+                <th className="text-center text-xs font-semibold text-muted-foreground px-5 py-3.5">Offers</th>
+                <th className="text-right text-xs font-semibold text-muted-foreground px-5 py-3.5"></th>
               </tr>
             </thead>
-
             <tbody>
               {loading && (
                 <tr>
@@ -437,325 +245,72 @@ export default function Students() {
               {!loading && filtered.length === 0 && (
                 <tr>
                   <td colSpan={8} className="px-5 py-10">
-                    <div className="text-center text-sm text-muted-foreground">
-                      No students found. Add your first student.
-                    </div>
+                    <div className="text-center text-sm text-muted-foreground">No students found for this institute yet.</div>
                   </td>
                 </tr>
               )}
 
               {!loading &&
-                filtered.map((s) => {
-                  const counts = countsByStudent.get(s.id) ?? {
-                    applications: 0,
-                    offers: 0,
-                  };
-
-                  return (
-                    <tr
-                      key={s.id}
-                      className="border-b border-border last:border-0 hover:bg-secondary/30 transition-colors"
-                    >
-                      <td className="px-5 py-4 text-sm font-medium text-foreground">
-                        {s.name}
-                      </td>
-                      <td className="px-5 py-4">
-                        <Badge variant="secondary" className="text-xs">
-                          {s.branch}
-                        </Badge>
-                      </td>
-                      <td className="px-5 py-4 text-sm text-muted-foreground">
-                        {s.batch}
-                      </td>
-                      <td className="px-5 py-4 text-sm text-foreground font-medium">
-                        {s.cgpa}
-                      </td>
-                      <td className="px-5 py-4">
-                        <StatusBadge status={s.status} />
-                      </td>
-                      <td className="px-5 py-4 text-sm text-foreground">
-                        {counts.applications}
-                      </td>
-                      <td className="px-5 py-4 text-sm text-foreground">
-                        {counts.offers}
-                      </td>
-                      <td className="px-5 py-4">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => setSelectedStudentId(s.id)}
-                        >
-                          View
-                        </Button>
-                      </td>
-                    </tr>
-                  );
-                })}
+                filtered.map((st) => (
+                  <tr key={st.uid} className="border-b border-border last:border-0 hover:bg-secondary/30 transition-colors">
+                    <td className="px-5 py-4">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-foreground">{st.name}</span>
+                        {st.email ? <Badge variant="secondary" className="text-[11px]">{st.email}</Badge> : null}
+                      </div>
+                    </td>
+                    <td className="px-5 py-4 text-sm text-foreground">{st.branch || "—"}</td>
+                    <td className="px-5 py-4 text-sm text-foreground">{st.batch || "—"}</td>
+                    <td className="px-5 py-4 text-sm text-center text-foreground">{st.cgpa ?? "—"}</td>
+                    <td className="px-5 py-4">
+                      <StatusBadge status={st.status} />
+                    </td>
+                    <td className="px-5 py-4 text-sm text-center text-foreground">{st.applications}</td>
+                    <td className="px-5 py-4 text-sm text-center text-foreground">{st.offers}</td>
+                    <td className="px-5 py-4 text-right">
+                      <Button variant="ghost" size="sm" onClick={() => setSelectedUid(st.uid)}>
+                        Notes <StickyNote className="w-3.5 h-3.5 ml-1" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
             </tbody>
           </table>
         </div>
       </div>
 
-      {/* Add Student Dialog */}
-      <Dialog open={addOpen} onOpenChange={setAddOpen}>
-        <DialogContent className="max-w-lg">
+      <Dialog open={!!selected} onOpenChange={() => setSelectedUid(null)}>
+        <DialogContent className="max-w-xl">
           <DialogHeader>
-            <DialogTitle>Add Student</DialogTitle>
+            <DialogTitle>Student Notes</DialogTitle>
           </DialogHeader>
-
-          <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label>Name</Label>
-                <Input
-                  value={form.name}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, name: e.target.value }))
-                  }
-                  placeholder="e.g. Aarav Patel"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>Roll No (optional)</Label>
-                <Input
-                  value={form.rollNo}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, rollNo: e.target.value }))
-                  }
-                  placeholder="e.g. 2026CSE045"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label>Email (optional)</Label>
-                <Input
-                  value={form.email}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, email: e.target.value }))
-                  }
-                  placeholder="student@college.edu"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>CGPA</Label>
-                <Input
-                  value={form.cgpa}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, cgpa: e.target.value }))
-                  }
-                  placeholder="8.5"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-4">
-              <div className="space-y-2">
-                <Label>Branch</Label>
-                <Select
-                  value={form.branch}
-                  onValueChange={(v) => setForm((p) => ({ ...p, branch: v }))}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {branches.map((b) => (
-                      <SelectItem key={b} value={b}>
-                        {b}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+          {selected && (
+            <div className="space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold">{selected.name}</p>
+                  <p className="text-xs text-muted-foreground">{selected.email ?? ""}</p>
+                  <div className="flex gap-2 mt-2 flex-wrap">
+                    {selected.branch ? <Badge variant="secondary">{selected.branch}</Badge> : null}
+                    {selected.batch ? <Badge variant="secondary">Batch {selected.batch}</Badge> : null}
+                    {selected.cgpa != null ? <Badge variant="outline">CGPA {selected.cgpa}</Badge> : null}
+                  </div>
+                </div>
+                <StatusBadge status={selected.status} />
               </div>
 
               <div className="space-y-2">
-                <Label>Batch</Label>
-                <Select
-                  value={form.batch}
-                  onValueChange={(v) => setForm((p) => ({ ...p, batch: v }))}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {batches.map((b) => (
-                      <SelectItem key={b} value={b}>
-                        {b}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <Label>Notes (TPO only)</Label>
+                <Textarea rows={8} value={notesDraft} onChange={(e) => setNotesDraft(e.target.value)} />
               </div>
 
-              <div className="space-y-2">
-                <Label>Status</Label>
-                <Select
-                  value={form.status}
-                  onValueChange={(v) => setForm((p) => ({ ...p, status: v }))}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {placementStatuses.map((s) => (
-                      <SelectItem key={s} value={s}>
-                        {s}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <Label>Notes (optional)</Label>
-              <Textarea
-                value={form.notes}
-                onChange={(e) =>
-                  setForm((p) => ({ ...p, notes: e.target.value }))
-                }
-                placeholder="Any TPO notes…"
-                className="min-h-[90px]"
-              />
-            </div>
-
-            <div className="flex justify-end">
-              <Button onClick={createStudent} disabled={saving}>
-                {saving ? "Saving…" : "Add Student"}
+              <Button size="sm" onClick={saveNotes} disabled={notesSaving}>
+                {notesSaving ? (<><Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> Saving…</>) : (<><Save className="h-4 w-4 mr-1.5" /> Save notes</>)}
               </Button>
             </div>
-          </div>
+          )}
         </DialogContent>
       </Dialog>
-
-      {/* Student Detail Panel */}
-      {student && (
-        <div className="fixed inset-0 z-50 flex justify-end">
-          <div
-            className="absolute inset-0 bg-foreground/20"
-            onClick={() => setSelectedStudentId(null)}
-          />
-          <div className="relative w-full max-w-md bg-card border-l border-border overflow-y-auto animate-slide-in-right">
-            <div className="sticky top-0 bg-card border-b border-border px-6 py-4 flex items-center justify-between z-10">
-              <div>
-                <h2 className="text-lg font-semibold text-foreground">
-                  {student.name}
-                </h2>
-                <p className="text-sm text-muted-foreground">
-                  {student.branch} · Batch {student.batch}
-                </p>
-              </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setSelectedStudentId(null)}
-              >
-                <X className="w-4 h-4" />
-              </Button>
-            </div>
-
-            <div className="p-6 space-y-6">
-              <div className="flex items-center gap-2">
-                <StatusBadge status={student.status} />
-                <Badge variant="secondary" className="text-xs">
-                  CGPA: {student.cgpa}
-                </Badge>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-secondary/50 rounded-lg p-4">
-                  <p className="text-xs text-muted-foreground">Applications</p>
-                  <p className="text-xl font-bold text-foreground">
-                    {countsByStudent.get(student.id)?.applications ?? 0}
-                  </p>
-                </div>
-                <div className="bg-secondary/50 rounded-lg p-4">
-                  <p className="text-xs text-muted-foreground">Offers</p>
-                  <p className="text-xl font-bold text-foreground">
-                    {countsByStudent.get(student.id)?.offers ?? 0}
-                  </p>
-                </div>
-              </div>
-
-              <div>
-                <h3 className="text-sm font-semibold text-foreground mb-3">
-                  Application Pipeline
-                </h3>
-                <div className="space-y-2">
-                  {studentApps.length === 0 && (
-                    <div className="text-sm text-muted-foreground">
-                      No applications yet.
-                    </div>
-                  )}
-
-                  {studentApps.slice(0, 6).map((a) => (
-                    <div
-                      key={a.id}
-                      className="flex items-center justify-between gap-2 p-2.5 rounded-lg bg-secondary/40"
-                    >
-                      <div className="text-sm text-foreground">
-                        {a.company} — {a.role}
-                      </div>
-                      <StatusBadge status={a.status} />
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <h3 className="text-sm font-semibold text-foreground mb-3">
-                  Upcoming Events
-                </h3>
-                {upcoming.length === 0 ? (
-                  <div className="text-sm text-muted-foreground">
-                    No upcoming events.
-                  </div>
-                ) : (
-                  <div className="space-y-2 text-sm text-muted-foreground">
-                    {upcoming.map((e) => (
-                      <div
-                        key={e.id}
-                        className="flex items-center justify-between"
-                      >
-                        <span>
-                          {fmtDate(e.date)} — {e.label} — {e.company}
-                        </span>
-                        <span className="text-xs">{e.role}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              <div>
-                <h3 className="text-sm font-semibold text-foreground mb-3 flex items-center gap-1.5">
-                  <StickyNote className="w-4 h-4" /> TPO Notes
-                </h3>
-
-                <Textarea
-                  value={notesDraft}
-                  onChange={(e) => setNotesDraft(e.target.value)}
-                  className="min-h-[110px]"
-                  placeholder="Write notes about this student…"
-                />
-
-                <div className="pt-3 flex justify-end">
-                  <Button
-                    variant="outline"
-                    onClick={saveNotes}
-                    disabled={notesSaving}
-                  >
-                    <Save className="w-4 h-4 mr-1.5" />
-                    {notesSaving ? "Saving…" : "Save Notes"}
-                  </Button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

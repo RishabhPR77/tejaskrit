@@ -7,13 +7,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { useToast } from "@/hooks/use-toast";
 
 export default function Login() {
-  const {
-    user,
-    profile,
-    loginWithEmailPassword,
-    registerWithEmailPassword,
-    loginDemoCollege,
-  } = useAuth();
+  const { user, profile, loginWithEmailPassword, registerWithEmailPassword } = useAuth();
   const { toast } = useToast();
   const navigate = useNavigate();
   const location = useLocation();
@@ -39,11 +33,13 @@ export default function Login() {
   useEffect(() => {
     if (!user) return;
 
-    if (profile?.role === "tpo" && profile?.instituteId) {
+    // If logged in and already onboarded
+    if ((profile?.role === "tpo" || profile?.role === "admin") && profile?.instituteId) {
       navigate(from, { replace: true });
       return;
     }
 
+    // Needs institute setup
     navigate("/register-college", { replace: true });
   }, [user, profile, navigate, from]);
 
@@ -65,8 +61,7 @@ export default function Login() {
     setBusy(true);
     try {
       if (password2 !== password3) throw new Error("Passwords do not match.");
-      if (password2.length < 6)
-        throw new Error("Password must be at least 6 characters.");
+      if (password2.length < 6) throw new Error("Password must be at least 6 characters.");
 
       await registerWithEmailPassword({
         name,
@@ -83,40 +78,17 @@ export default function Login() {
     }
   };
 
-  const onDemo = async () => {
-    setBusy(true);
-    try {
-      await loginDemoCollege();
-      navigate("/", { replace: true });
-    } catch (e: any) {
-      toast({
-        title: "Demo login failed",
-        description:
-          e?.message ??
-          "Anonymous sign-in is disabled in Firebase. Enable it or remove demo login.",
-        variant: "destructive",
-      });
-      setBusy(false);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-background flex items-center justify-center px-6">
       <div className="w-full max-w-md">
         <div className="text-center mb-6">
-          <div className="font-brand text-3xl font-bold text-primary">
-            Tejaskrit
-          </div>
-          <p className="text-sm text-muted-foreground mt-1">
-            TPO Panel — Training & Placement Cell
-          </p>
+          <div className="font-brand text-3xl font-bold text-primary">Tejaskrit</div>
+          <p className="text-sm text-muted-foreground mt-1">TPO Panel — Training & Placement Cell</p>
         </div>
 
         <Card className="card-shadow-lg">
           <CardHeader className="space-y-2">
-            <CardTitle className="text-xl">
-              {mode === "signin" ? "Sign in" : "Create account"}
-            </CardTitle>
+            <CardTitle className="text-xl">{mode === "signin" ? "Sign in" : "Create account"}</CardTitle>
 
             <div className="flex gap-2">
               <Button
@@ -200,9 +172,7 @@ export default function Login() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <label className="text-sm font-medium">
-                    Confirm Password
-                  </label>
+                  <label className="text-sm font-medium">Confirm Password</label>
                   <Input
                     type="password"
                     placeholder="repeat password"
@@ -218,20 +188,9 @@ export default function Login() {
               </>
             )}
 
-            <div className="pt-2 border-t border-border">
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={onDemo}
-                disabled={busy}
-              >
-                Use Demo College Login
-              </Button>
-              <p className="text-xs text-muted-foreground mt-2 leading-relaxed">
-                Demo uses Anonymous Sign-in (Firebase). If you don’t want demo,
-                remove this button.
-              </p>
-            </div>
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Note: This panel is for Training & Placement officers. Students should use the Candidate app.
+            </p>
           </CardContent>
         </Card>
       </div>

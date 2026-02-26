@@ -12,8 +12,8 @@ export default function RequireTpo({ children }: { children: JSX.Element }) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   }
 
-  // Only TPOs can access this panel
-  if (profile?.role !== "tpo") {
+  // Only TPO/Admin can access this panel
+  if (profile?.role !== "tpo" && profile?.role !== "admin") {
     return <Navigate to="/access-denied" replace />;
   }
 

@@ -16,44 +16,13 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 
 import { useAuth } from "@/auth/AuthProvider";
-import { db } from "@/lib/firebase";
+import type { ApplicationDoc, InstituteMemberDoc, JobDoc } from "@/lib/types";
 import {
-  collection,
-  onSnapshot,
-  query,
-  Timestamp,
-  where,
-} from "firebase/firestore";
-import { downloadCSV } from "@/lib/download";
-
-type StudentDoc = {
-  instituteId: string;
-  name: string;
-  branch: string;
-  batch: string;
-  cgpa: number;
-};
-
-type Student = StudentDoc & { id: string };
-
-type AppDoc = {
-  instituteId: string;
-  studentId: string;
-  studentName: string;
-  company: string;
-  role: string;
-  status: string;
-  appliedAt?: Timestamp | null;
-  createdAt?: any;
-  updatedAt?: any;
-};
-
-type Application = AppDoc & { id: string };
-
-function toDate(ts?: Timestamp | null) {
-  if (!ts) return null;
-  return ts.toDate();
-}
+  jobIdFromAny,
+  watchInstituteApplications,
+  watchInstituteJobs,
+  watchInstituteMembers,
+} from "@/lib/firestore";
 
 function msAny(ts: any) {
   try {
@@ -74,11 +43,12 @@ function normalizeStatus(s: string) {
   if (x.includes("interview")) return "Interview";
   if (x.includes("oa")) return "OA";
   if (x.includes("applied")) return "Applied";
+  if (x.includes("tailored")) return "Tailored";
+  if (x.includes("saved")) return "Saved";
   return "Other";
 }
 
 function weekKey(d: Date) {
-  // week starting Monday
   const t = new Date(d);
   const day = (t.getDay() + 6) % 7; // Mon=0
   t.setDate(t.getDate() - day);
@@ -91,164 +61,103 @@ export default function Analytics() {
   const instituteId = profile?.instituteId ?? null;
 
   const [loading, setLoading] = useState(true);
-  const [students, setStudents] = useState<Student[]>([]);
-  const [apps, setApps] = useState<Application[]>([]);
+  const [members, setMembers] = useState<Array<{ id: string; data: InstituteMemberDoc }>>([]);
+  const [apps, setApps] = useState<Array<{ id: string; data: ApplicationDoc }>>([]);
+  const [jobs, setJobs] = useState<Array<{ id: string; data: JobDoc }>>([]);
 
   useEffect(() => {
     if (!instituteId) return;
-
     setLoading(true);
 
-    const u1 = onSnapshot(
-      query(
-        collection(db, "students"),
-        where("instituteId", "==", instituteId),
-      ),
-      (snap) => {
-        const list: Student[] = snap.docs.map((d) => ({
-          id: d.id,
-          ...(d.data() as StudentDoc),
-        }));
-        list.sort((a, b) => a.name.localeCompare(b.name));
-        setStudents(list);
-      },
-    );
-
-    const u2 = onSnapshot(
-      query(
-        collection(db, "applications"),
-        where("instituteId", "==", instituteId),
-      ),
-      (snap) => {
-        const list: Application[] = snap.docs.map((d) => ({
-          id: d.id,
-          ...(d.data() as AppDoc),
-        }));
-        setApps(list);
-        setLoading(false);
-      },
-    );
+    const u1 = watchInstituteMembers(instituteId, (rows) => setMembers(rows));
+    const u2 = watchInstituteApplications(instituteId, (rows) => {
+      setApps(rows);
+      setLoading(false);
+    });
+    const u3 = watchInstituteJobs(instituteId, (rows) => setJobs(rows));
 
     return () => {
       u1();
       u2();
+      u3();
     };
   }, [instituteId]);
 
-  const studentMap = useMemo(() => {
-    const m = new Map<string, Student>();
-    students.forEach((s) => m.set(s.id, s));
-    return m;
-  }, [students]);
-
-  const funnel = useMemo(() => {
-    const counts: Record<string, number> = {
-      Applied: 0,
-      OA: 0,
-      Interview: 0,
-      Offer: 0,
-      Joined: 0,
-      Rejected: 0,
-      Other: 0,
-    };
+  const statusPie = useMemo(() => {
+    const counts = new Map<string, number>();
     for (const a of apps) {
-      counts[normalizeStatus(a.status)] =
-        (counts[normalizeStatus(a.status)] ?? 0) + 1;
+      const k = normalizeStatus(a.data.status);
+      counts.set(k, (counts.get(k) ?? 0) + 1);
     }
-    return counts;
-  }, [apps]);
-
-  const funnelPie = useMemo(() => {
-    const keys = ["Applied", "OA", "Interview", "Offer", "Joined", "Rejected"];
-    return keys
-      .map((k) => ({ name: k, value: funnel[k] ?? 0 }))
-      .filter((x) => x.value > 0);
-  }, [funnel]);
-
-  const topCompanies = useMemo(() => {
-    const m = new Map<string, number>();
-    apps.forEach((a) => m.set(a.company, (m.get(a.company) ?? 0) + 1));
-    const list = Array.from(m.entries()).map(([company, count]) => ({
-      company,
-      count,
-    }));
-    list.sort((a, b) => b.count - a.count);
-    return list.slice(0, 10);
+    return Array.from(counts.entries()).map(([name, value]) => ({ name, value }));
   }, [apps]);
 
   const offersByBranch = useMemo(() => {
-    const m = new Map<string, number>();
-    apps.forEach((a) => {
-      const s = studentMap.get(a.studentId);
-      if (!s) return;
-      const st = normalizeStatus(a.status);
-      if (st === "Offer" || st === "Joined") {
-        m.set(s.branch, (m.get(s.branch) ?? 0) + 1);
-      }
-    });
-    const list = Array.from(m.entries()).map(([branch, offers]) => ({
-      branch,
-      offers,
-    }));
-    list.sort((a, b) => b.offers - a.offers);
-    return list;
-  }, [apps, studentMap]);
+    const memberByUid = new Map(members.map((m) => [m.id, m.data]));
+    const counts = new Map<string, number>();
+    for (const a of apps) {
+      if (a.data.status !== "offer" && a.data.status !== "joined") continue;
+      const branch = memberByUid.get(a.data.userId)?.branch || "Unknown";
+      counts.set(branch, (counts.get(branch) ?? 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([branch, offers]) => ({ branch, offers }))
+      .sort((a, b) => b.offers - a.offers);
+  }, [apps, members]);
+
+  const drivesStatus = useMemo(() => {
+    const open = jobs.filter((j) => j.data.status !== "closed").length;
+    const closed = jobs.filter((j) => j.data.status === "closed").length;
+    return [
+      { name: "Open", value: open },
+      { name: "Closed", value: closed },
+    ];
+  }, [jobs]);
 
   const weeklyTrend = useMemo(() => {
-    // last 8 weeks
-    const now = new Date();
-    const weeks: string[] = [];
-    for (let i = 7; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i * 7);
-      weeks.push(weekKey(d));
+    const map = new Map<string, number>();
+    for (const a of apps) {
+      const ms = msAny(a.data.appliedAt) || msAny(a.data.createdAt) || msAny(a.data.updatedAt);
+      if (!ms) continue;
+      const wk = weekKey(new Date(ms));
+      map.set(wk, (map.get(wk) ?? 0) + 1);
     }
-    const m = new Map<string, number>();
-    weeks.forEach((w) => m.set(w, 0));
-
-    apps.forEach((a) => {
-      const d =
-        toDate(a.appliedAt ?? null) ??
-        (msAny(a.createdAt) ? new Date(msAny(a.createdAt)) : null);
-      if (!d) return;
-      const wk = weekKey(d);
-      if (m.has(wk)) m.set(wk, (m.get(wk) ?? 0) + 1);
-    });
-
-    return weeks.map((w) => ({
-      week: w.slice(5),
-      applications: m.get(w) ?? 0,
-    }));
+    return Array.from(map.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .slice(-10)
+      .map(([week, applications]) => ({ week, applications }));
   }, [apps]);
 
-  const exportReport = () => {
-    const rows = apps.map((a) => {
-      const s = studentMap.get(a.studentId);
-      return {
-        student: a.studentName,
-        branch: s?.branch ?? "",
-        batch: s?.batch ?? "",
-        company: a.company,
-        role: a.role,
-        status: a.status,
-        appliedAt: toDate(a.appliedAt ?? null)?.toISOString?.() ?? "",
-      };
-    });
-    downloadCSV(`tejaskrit_report_${Date.now()}.csv`, rows);
+  const exportCSV = () => {
+    const headers = ["Metric", "Value"];
+    const lines = [headers.join(",")];
+
+    lines.push(["Total Students", String(members.filter((m) => m.data.role === "student").length)].join(","));
+    lines.push(["Total Drives", String(jobs.length)].join(","));
+    lines.push(["Total Applications", String(apps.length)].join(","));
+    lines.push(["Offers", String(apps.filter((a) => a.data.status === "offer").length)].join(","));
+    lines.push(["Joined", String(apps.filter((a) => a.data.status === "joined").length)].join(","));
+
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "analytics_summary.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   };
 
   return (
     <div className="space-y-6 animate-fade-in">
-      <div className="flex items-start justify-between gap-4">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Analytics</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            Live funnel and trends from Firestore
-          </p>
+          <p className="text-sm text-muted-foreground mt-1">Real-time metrics from /jobs, /applications and institute members</p>
         </div>
-
-        <Button variant="outline" onClick={exportReport}>
-          <Download className="w-4 h-4 mr-2" /> Export CSV
+        <Button variant="outline" size="sm" onClick={exportCSV}>
+          <Download className="w-4 h-4 mr-1.5" /> Export summary
         </Button>
       </div>
 
@@ -256,112 +165,73 @@ export default function Analytics() {
         <div className="flex items-center gap-2 text-muted-foreground">
           <Loader2 className="h-4 w-4 animate-spin" /> Loading…
         </div>
-      ) : (
-        <>
-          <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-            <Card className="card-shadow">
-              <CardHeader>
-                <CardTitle className="text-base">Placement Funnel</CardTitle>
-              </CardHeader>
-              <CardContent className="h-[260px]">
-                {funnelPie.length === 0 ? (
-                  <div className="text-sm text-muted-foreground">
-                    No data yet.
-                  </div>
-                ) : (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart>
-                      <Pie
-                        data={funnelPie}
-                        dataKey="value"
-                        nameKey="name"
-                        outerRadius={90}
-                        fill="hsl(var(--primary))"
-                        label
-                      />
-                      <Tooltip />
-                    </PieChart>
-                  </ResponsiveContainer>
-                )}
-              </CardContent>
-            </Card>
+      ) : null}
 
-            <Card className="card-shadow xl:col-span-2">
-              <CardHeader>
-                <CardTitle className="text-base">
-                  Weekly Applications (Last 8 weeks)
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="h-[260px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={weeklyTrend}>
-                    <XAxis dataKey="week" />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip />
-                    <Bar
-                      dataKey="applications"
-                      fill="hsl(var(--primary))"
-                      radius={[6, 6, 0, 0]}
-                    />
-                  </BarChart>
-                </ResponsiveContainer>
-              </CardContent>
-            </Card>
-          </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <Card className="card-shadow">
+          <CardHeader>
+            <CardTitle className="text-base">Applications by Status</CardTitle>
+          </CardHeader>
+          <CardContent className="h-72">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={statusPie} dataKey="value" nameKey="name" outerRadius={90} label />
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
 
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-            <Card className="card-shadow">
-              <CardHeader>
-                <CardTitle className="text-base">Top Companies</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                {topCompanies.length === 0 ? (
-                  <div className="text-sm text-muted-foreground">
-                    No data yet.
-                  </div>
-                ) : (
-                  topCompanies.map((c) => (
-                    <div
-                      key={c.company}
-                      className="flex items-center justify-between p-2.5 rounded-lg bg-secondary/30"
-                    >
-                      <span className="text-sm text-foreground">
-                        {c.company}
-                      </span>
-                      <Badge variant="secondary">{c.count}</Badge>
-                    </div>
-                  ))
-                )}
-              </CardContent>
-            </Card>
+        <Card className="card-shadow">
+          <CardHeader>
+            <CardTitle className="text-base">Offers by Branch</CardTitle>
+          </CardHeader>
+          <CardContent className="h-72">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={offersByBranch}>
+                <XAxis dataKey="branch" />
+                <YAxis allowDecimals={false} />
+                <Tooltip />
+                <Bar dataKey="offers" />
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
 
-            <Card className="card-shadow">
-              <CardHeader>
-                <CardTitle className="text-base">Offers by Branch</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                {offersByBranch.length === 0 ? (
-                  <div className="text-sm text-muted-foreground">
-                    No offers yet.
-                  </div>
-                ) : (
-                  offersByBranch.map((b) => (
-                    <div
-                      key={b.branch}
-                      className="flex items-center justify-between p-2.5 rounded-lg bg-secondary/30"
-                    >
-                      <span className="text-sm text-foreground">
-                        {b.branch}
-                      </span>
-                      <Badge variant="secondary">{b.offers}</Badge>
-                    </div>
-                  ))
-                )}
-              </CardContent>
-            </Card>
-          </div>
-        </>
-      )}
+        <Card className="card-shadow">
+          <CardHeader>
+            <CardTitle className="text-base">Drives Status</CardTitle>
+          </CardHeader>
+          <CardContent className="h-72">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={drivesStatus} dataKey="value" nameKey="name" outerRadius={90} label />
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+            <div className="flex gap-2 mt-3">
+              <Badge variant="secondary">Open: {drivesStatus[0].value}</Badge>
+              <Badge variant="secondary">Closed: {drivesStatus[1].value}</Badge>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="card-shadow">
+          <CardHeader>
+            <CardTitle className="text-base">Weekly Applications Trend</CardTitle>
+          </CardHeader>
+          <CardContent className="h-72">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={weeklyTrend}>
+                <XAxis dataKey="week" />
+                <YAxis allowDecimals={false} />
+                <Tooltip />
+                <Bar dataKey="applications" />
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }

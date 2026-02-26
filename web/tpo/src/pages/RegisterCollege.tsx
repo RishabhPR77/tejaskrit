@@ -37,19 +37,19 @@ export default function RegisterCollege() {
   const onSubmit = async () => {
     setBusy(true);
     try {
-      const allowedDomains = domains
+      const domainsAllowed = domains
         .split(",")
         .map((d) => d.trim().toLowerCase())
         .filter(Boolean);
 
       if (!instituteName.trim()) throw new Error("Institute name is required");
-      if (allowedDomains.length === 0)
+      if (domainsAllowed.length === 0)
         throw new Error("At least one email domain is required");
 
       await registerCollege({
         instituteName,
         instituteCode,
-        allowedDomains,
+        domainsAllowed,
       });
 
       toast({

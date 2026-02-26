@@ -34,65 +34,24 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
 
 import { useAuth } from "@/auth/AuthProvider";
-import { db } from "@/lib/firebase";
+import type { ApplicationDoc, JobDoc } from "@/lib/types";
 import {
-  addDoc,
-  collection,
-  onSnapshot,
-  orderBy,
-  query,
-  serverTimestamp,
-  Timestamp,
-  where,
-} from "firebase/firestore";
+  createInstituteJob,
+  broadcastNewDriveToCandidates,
+  jobIdFromAny,
+  updateJobStatus,
+  watchInstituteApplications,
+  watchInstituteJobs,
+} from "@/lib/firestore";
+import type { Timestamp } from "firebase/firestore";
 
 const steps = ["Job Details", "Eligibility", "Dates", "Publish"];
 
-type DriveDoc = {
-  instituteId: string;
-  createdBy: string;
-  createdAt?: any;
-  updatedAt?: any;
-
-  title: string;
-  company: string;
-  location?: string | null;
-  jobType?: "full-time" | "intern" | "contract" | string;
-  ctcOrStipend?: string | null;
-  applyUrl?: string | null;
-  jdText?: string | null;
-
-  verified: boolean;
-  status: "Active" | "Closed";
-
-  eligibility: {
-    branches: string[];
-    batch?: string | null;
-    minCgpa?: number | null;
-    skills?: string[];
-    seatLimit?: number | null;
-  };
-
-  deadlineAt: Timestamp;
-  oaAt?: Timestamp | null;
-  interviewStartAt?: Timestamp | null;
-  interviewEndAt?: Timestamp | null;
-
-  stats?: {
-    eligibleEstimate?: number;
-    applicants?: number;
-  };
-};
-
-type Drive = DriveDoc & { id: string };
+type Row = { id: string; data: JobDoc };
 
 function formatDate(d: Date | null) {
   if (!d) return "—";
-  return d.toLocaleDateString("en-IN", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
+  return d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
 }
 
 function toDate(ts?: Timestamp | null) {
@@ -117,17 +76,18 @@ export default function DrivesJobs() {
   const [searchText, setSearchText] = useState("");
   const [wizardOpen, setWizardOpen] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
-  const [selectedDriveId, setSelectedDriveId] = useState<string | null>(null);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(true);
-  const [drives, setDrives] = useState<Drive[]>([]);
+  const [jobs, setJobs] = useState<Row[]>([]);
+  const [apps, setApps] = useState<Array<{ id: string; data: ApplicationDoc }>>([]);
   const [saving, setSaving] = useState(false);
 
   const [form, setForm] = useState({
     title: "",
     company: "",
     location: "",
-    jobType: "" as "" | "full-time" | "intern" | "contract",
+    jobType: "" as "" | "Full-time" | "Internship",
     ctcOrStipend: "",
     applyUrl: "",
     jdText: "",
@@ -144,60 +104,47 @@ export default function DrivesJobs() {
     interviewEnd: "",
   });
 
-  // Realtime drives list for this institute
   useEffect(() => {
     if (!instituteId) return;
 
     setLoading(true);
+    const u1 = watchInstituteJobs(instituteId, (rows) => {
+      setJobs(rows);
+      setLoading(false);
+    });
 
-    const q = query(
-      collection(db, "drives"),
-      where("instituteId", "==", instituteId),
-      orderBy("deadlineAt", "desc"),
-    );
+    const u2 = watchInstituteApplications(instituteId, (rows) => setApps(rows));
 
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const rows: Drive[] = snap.docs.map((d) => {
-          const data = d.data() as DriveDoc;
-          return { id: d.id, ...data };
-        });
-        setDrives(rows);
-        setLoading(false);
-      },
-      (err) => {
-        console.error(err);
-        setLoading(false);
-        toast({
-          title: "Failed to load drives",
-          description: err?.message ?? "Check Firestore and network.",
-          variant: "destructive",
-        });
-      },
-    );
+    return () => {
+      u1();
+      u2();
+    };
+  }, [instituteId]);
 
-    return () => unsub();
-  }, [instituteId, toast]);
+  const appsByJobId = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of apps) {
+      const jid = jobIdFromAny(a.data.jobId);
+      if (!jid) continue;
+      m.set(jid, (m.get(jid) ?? 0) + 1);
+    }
+    return m;
+  }, [apps]);
 
   const filtered = useMemo(() => {
     const s = searchText.trim().toLowerCase();
-    if (!s) return drives;
-    return drives.filter(
-      (d) =>
-        d.title.toLowerCase().includes(s) ||
-        d.company.toLowerCase().includes(s),
+    if (!s) return jobs;
+    return jobs.filter(
+      (r) => r.data.title.toLowerCase().includes(s) || r.data.company.toLowerCase().includes(s),
     );
-  }, [drives, searchText]);
+  }, [jobs, searchText]);
 
-  const selectedDrive = useMemo(() => {
-    return selectedDriveId
-      ? (drives.find((d) => d.id === selectedDriveId) ?? null)
-      : null;
-  }, [selectedDriveId, drives]);
+  const selected = useMemo(
+    () => (selectedJobId ? jobs.find((d) => d.id === selectedJobId) ?? null : null),
+    [selectedJobId, jobs],
+  );
 
   const estimatedEligible = useMemo(() => {
-    // demo estimate: base 180 per branch
     const base = 180;
     const multiplier = Math.max(1, form.eligibleBranches.length);
     return base * multiplier;
@@ -236,7 +183,7 @@ export default function DrivesJobs() {
     });
   };
 
-  const publishDrive = async () => {
+  const publish = async () => {
     if (!user || !instituteId) {
       toast({
         title: "Not ready",
@@ -246,18 +193,9 @@ export default function DrivesJobs() {
       return;
     }
 
-    if (!form.title.trim()) {
-      toast({ title: "Role title required", variant: "destructive" });
-      return;
-    }
-    if (!form.company.trim()) {
-      toast({ title: "Company required", variant: "destructive" });
-      return;
-    }
-    if (!form.deadlineLocal) {
-      toast({ title: "Deadline required", variant: "destructive" });
-      return;
-    }
+    if (!form.title.trim()) return toast({ title: "Role title required", variant: "destructive" });
+    if (!form.company.trim()) return toast({ title: "Company required", variant: "destructive" });
+    if (!form.deadlineLocal) return toast({ title: "Deadline required", variant: "destructive" });
 
     const deadlineDate = new Date(form.deadlineLocal);
     if (Number.isNaN(deadlineDate.getTime())) {
@@ -265,10 +203,8 @@ export default function DrivesJobs() {
       return;
     }
 
-    const minCgpaNum =
-      form.minCgpa.trim() === "" ? null : Number.parseFloat(form.minCgpa);
-    const seatLimitNum =
-      form.seatLimit.trim() === "" ? null : Number.parseInt(form.seatLimit, 10);
+    const minCgpaNum = form.minCgpa.trim() === "" ? null : Number.parseFloat(form.minCgpa);
+    const seatLimitNum = form.seatLimit.trim() === "" ? null : Number.parseInt(form.seatLimit, 10);
 
     const skills =
       form.skillsCsv
@@ -276,66 +212,68 @@ export default function DrivesJobs() {
         .map((s) => s.trim())
         .filter(Boolean) ?? [];
 
-    const oaAt = form.oaLocal
-      ? Timestamp.fromDate(new Date(form.oaLocal))
-      : null;
-    const interviewStartAt = form.interviewStart
-      ? Timestamp.fromDate(new Date(form.interviewStart))
-      : null;
-    const interviewEndAt = form.interviewEnd
-      ? Timestamp.fromDate(new Date(form.interviewEnd))
-      : null;
-
-    const payload: DriveDoc = {
-      instituteId,
-      createdBy: user.uid,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-
-      title: form.title.trim(),
-      company: form.company.trim(),
-      location: form.location.trim() || null,
-      jobType: form.jobType || "intern",
-      ctcOrStipend: form.ctcOrStipend.trim() || null,
-      applyUrl: form.applyUrl.trim() || null,
-      jdText: form.jdText.trim() || null,
-
-      verified: true,
-      status: "Active",
-
-      eligibility: {
-        branches: form.eligibleBranches,
-        batch: form.batch || null,
-        minCgpa: minCgpaNum,
-        skills,
-        seatLimit: seatLimitNum,
-      },
-
-      deadlineAt: Timestamp.fromDate(deadlineDate),
-      oaAt,
-      interviewStartAt,
-      interviewEndAt,
-
-      stats: {
-        eligibleEstimate: estimatedEligible,
-        applicants: 0,
-      },
-    };
+    const oaAt = form.oaLocal ? new Date(form.oaLocal) : null;
+    const interviewStartAt = form.interviewStart ? new Date(form.interviewStart) : null;
+    const interviewEndAt = form.interviewEnd ? new Date(form.interviewEnd) : null;
 
     setSaving(true);
     try {
-      await addDoc(collection(db, "drives"), payload);
+      const jobId = await createInstituteJob({
+        instituteId,
+        createdBy: user.uid,
+        title: form.title,
+        company: form.company,
+        location: form.location,
+        jobType: form.jobType || "Internship",
+        ctcOrStipend: form.ctcOrStipend,
+        applyUrl: form.applyUrl,
+        jdText: form.jdText,
+        tags: skills,
+        eligibility: {
+          branches: form.eligibleBranches,
+          batch: form.batch || null,
+          minCgpa: minCgpaNum,
+          skills,
+          seatLimit: seatLimitNum,
+        },
+        deadlineAt: deadlineDate,
+        oaAt,
+        interviewStartAt,
+        interviewEndAt,
+      });
+
+      // ✅ Notify eligible students in Candidate app (writes /users/{uid}/notifications)
+      try {
+        await broadcastNewDriveToCandidates({
+          instituteId,
+          jobId,
+          title: form.title.trim(),
+          company: form.company.trim(),
+          deadlineAt: deadlineDate,
+          eligibility: {
+            branches: form.eligibleBranches,
+            batch: form.batch || null,
+            minCgpa: minCgpaNum,
+            skills,
+            seatLimit: seatLimitNum,
+          },
+        });
+      } catch (e) {
+        console.warn('Drive notification failed', e);
+      }
+
       toast({
         title: "Drive published",
-        description: "Saved to Firestore (Institute Verified).",
+        description: "Created in /jobs and notified eligible candidates.",
       });
+
       setWizardOpen(false);
       resetWizard();
     } catch (err: any) {
       console.error(err);
       toast({
         title: "Publish failed",
-        description: err?.message ?? "Check Firestore settings.",
+        description: err?.message ?? "Check Firestore permissions.",
         variant: "destructive",
       });
     } finally {
@@ -348,7 +286,7 @@ export default function DrivesJobs() {
       setCurrentStep((s) => s + 1);
       return;
     }
-    await publishDrive();
+    await publish();
   };
 
   return (
@@ -356,21 +294,14 @@ export default function DrivesJobs() {
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Drives & Jobs</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            Institute-verified campus placements (Firestore)
-          </p>
+          <p className="text-sm text-muted-foreground mt-1">Institute-verified campus placements (saved in /jobs)</p>
         </div>
 
         <div className="flex items-center gap-2">
           <Button
             variant="outline"
             size="sm"
-            onClick={() =>
-              toast({
-                title: "Import Job",
-                description: "Coming soon (UI ready).",
-              })
-            }
+            onClick={() => toast({ title: "Import Job", description: "Coming soon (UI ready)." })}
           >
             <Upload className="w-4 h-4 mr-1.5" /> Import Job
           </Button>
@@ -387,56 +318,29 @@ export default function DrivesJobs() {
         </div>
       </div>
 
-      {/* Search & Filter */}
       <div className="flex items-center gap-3">
         <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input
-            placeholder="Search drives..."
-            value={searchText}
-            onChange={(e) => setSearchText(e.target.value)}
-            className="pl-9"
-          />
+          <Input placeholder="Search drives..." value={searchText} onChange={(e) => setSearchText(e.target.value)} className="pl-9" />
         </div>
 
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() =>
-            toast({ title: "Filters", description: "Coming soon." })
-          }
-        >
+        <Button variant="outline" size="sm" onClick={() => toast({ title: "Filters", description: "Coming soon." })}>
           <Filter className="w-4 h-4 mr-1.5" /> Filters
         </Button>
       </div>
 
-      {/* Drives Table */}
       <div className="bg-card rounded-xl card-shadow border border-border overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead>
               <tr className="border-b border-border bg-secondary/40">
-                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">
-                  Title
-                </th>
-                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">
-                  Company
-                </th>
-                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">
-                  Deadline
-                </th>
-                <th className="text-center text-xs font-semibold text-muted-foreground px-5 py-3.5">
-                  Eligible
-                </th>
-                <th className="text-center text-xs font-semibold text-muted-foreground px-5 py-3.5">
-                  Applicants
-                </th>
-                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">
-                  Status
-                </th>
-                <th className="text-right text-xs font-semibold text-muted-foreground px-5 py-3.5">
-                  Actions
-                </th>
+                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">Title</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">Company</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">Deadline</th>
+                <th className="text-center text-xs font-semibold text-muted-foreground px-5 py-3.5">Eligible</th>
+                <th className="text-center text-xs font-semibold text-muted-foreground px-5 py-3.5">Applicants</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground px-5 py-3.5">Status</th>
+                <th className="text-right text-xs font-semibold text-muted-foreground px-5 py-3.5">Actions</th>
               </tr>
             </thead>
 
@@ -455,66 +359,45 @@ export default function DrivesJobs() {
               {!loading && filtered.length === 0 && (
                 <tr>
                   <td colSpan={7} className="px-5 py-10">
-                    <div className="text-center text-sm text-muted-foreground">
-                      No drives found. Create your first institute verified
-                      drive.
-                    </div>
+                    <div className="text-center text-sm text-muted-foreground">No drives found. Create your first institute verified drive.</div>
                   </td>
                 </tr>
               )}
 
               {!loading &&
-                filtered.map((d) => {
-                  const deadline = toDate(d.deadlineAt);
+                filtered.map((r) => {
+                  const deadline = toDate(r.data.sourceMeta?.deadlineAt ?? null);
                   const status =
-                    d.status === "Closed"
+                    r.data.status === "closed"
                       ? "Closed"
                       : isDeadlineSoon(deadline)
                         ? "Deadline Soon"
                         : "Active";
 
+                  const eligible =
+                    (r.data.sourceMeta?.eligibility?.branches?.length ?? 0) > 0
+                      ? 180 * (r.data.sourceMeta?.eligibility?.branches?.length ?? 1)
+                      : "—";
+
+                  const applicants = appsByJobId.get(r.id) ?? 0;
+
                   return (
-                    <tr
-                      key={d.id}
-                      className="border-b border-border last:border-0 hover:bg-secondary/30 transition-colors"
-                    >
+                    <tr key={r.id} className="border-b border-border last:border-0 hover:bg-secondary/30 transition-colors">
                       <td className="px-5 py-4">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-foreground">
-                            {d.title}
-                          </span>
-                          {d.verified && (
-                            <ShieldCheck className="w-3.5 h-3.5 text-primary" />
-                          )}
+                          <span className="text-sm font-medium text-foreground">{r.data.title}</span>
+                          <ShieldCheck className="w-3.5 h-3.5 text-primary" />
                         </div>
                       </td>
-
-                      <td className="px-5 py-4 text-sm text-foreground">
-                        {d.company}
-                      </td>
-
-                      <td className="px-5 py-4 text-sm text-muted-foreground">
-                        {formatDate(deadline)}
-                      </td>
-
-                      <td className="px-5 py-4 text-sm text-center text-foreground">
-                        {d.stats?.eligibleEstimate ?? "—"}
-                      </td>
-
-                      <td className="px-5 py-4 text-sm text-center text-foreground">
-                        {d.stats?.applicants ?? 0}
-                      </td>
-
+                      <td className="px-5 py-4 text-sm text-foreground">{r.data.company}</td>
+                      <td className="px-5 py-4 text-sm text-muted-foreground">{formatDate(deadline)}</td>
+                      <td className="px-5 py-4 text-sm text-center text-foreground">{eligible}</td>
+                      <td className="px-5 py-4 text-sm text-center text-foreground">{applicants}</td>
                       <td className="px-5 py-4">
                         <StatusBadge status={status} />
                       </td>
-
                       <td className="px-5 py-4 text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => setSelectedDriveId(d.id)}
-                        >
+                        <Button variant="ghost" size="sm" onClick={() => setSelectedJobId(r.id)}>
                           View <ChevronRight className="w-3.5 h-3.5 ml-1" />
                         </Button>
                       </td>
@@ -526,477 +409,251 @@ export default function DrivesJobs() {
         </div>
       </div>
 
-      {/* Create Drive Wizard */}
+      {/* Drive detail */}
+      <Dialog open={!!selected} onOpenChange={() => setSelectedJobId(null)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Drive details</DialogTitle>
+          </DialogHeader>
+          {selected && (
+            <div className="space-y-4">
+              <div>
+                <p className="text-lg font-semibold">{selected.data.title}</p>
+                <p className="text-sm text-muted-foreground">{selected.data.company} · {selected.data.location || "—"}</p>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="secondary">Institute Verified</Badge>
+                <Badge variant="outline">{selected.data.jobType || "Internship"}</Badge>
+                {selected.data.status === "closed" ? <Badge variant="destructive">Closed</Badge> : <Badge>Open</Badge>}
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <Label className="text-xs">Deadline</Label>
+                  <div className="text-sm">{formatDate(toDate(selected.data.sourceMeta?.deadlineAt ?? null))}</div>
+                </div>
+                <div>
+                  <Label className="text-xs">Applicants</Label>
+                  <div className="text-sm">{appsByJobId.get(selected.id) ?? 0}</div>
+                </div>
+              </div>
+
+              <div>
+                <Label className="text-xs">Eligibility</Label>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {(selected.data.sourceMeta?.eligibility?.branches ?? []).map((b) => (
+                    <Badge key={b} variant="secondary">{b}</Badge>
+                  ))}
+                  {selected.data.sourceMeta?.eligibility?.minCgpa ? (
+                    <Badge variant="outline">CGPA ≥ {selected.data.sourceMeta.eligibility.minCgpa}</Badge>
+                  ) : null}
+                  {selected.data.sourceMeta?.eligibility?.batch ? (
+                    <Badge variant="outline">Batch {selected.data.sourceMeta.eligibility.batch}</Badge>
+                  ) : null}
+                </div>
+              </div>
+
+              <div>
+                <Label className="text-xs">Job description</Label>
+                <Textarea className="mt-2" value={selected.data.jdText || ""} readOnly rows={8} />
+              </div>
+
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant={selected.data.status === "closed" ? "outline" : "destructive"}
+                  onClick={async () => {
+                    try {
+                      await updateJobStatus(selected.id, selected.data.status === "closed" ? "open" : "closed");
+                      toast({ title: "Updated", description: "Drive status updated." });
+                    } catch (e: any) {
+                      toast({ title: "Failed", description: e?.message ?? "Could not update status", variant: "destructive" });
+                    }
+                  }}
+                >
+                  {selected.data.status === "closed" ? "Reopen" : "Close"}
+                </Button>
+                {selected.data.applyUrl ? (
+                  <Button size="sm" variant="outline" onClick={() => window.open(selected.data.applyUrl!, "_blank", "noopener,noreferrer")}>
+                    Open Apply Link
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Create wizard */}
       <Dialog open={wizardOpen} onOpenChange={setWizardOpen}>
-        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+        <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>Create New Drive</DialogTitle>
           </DialogHeader>
 
-          {/* Progress Steps */}
-          <div className="flex items-center gap-2 mb-6">
-            {steps.map((s, i) => (
-              <div key={i} className="flex items-center gap-2 flex-1">
+          <div className="flex items-center gap-2 mb-4">
+            {steps.map((s, idx) => (
+              <div key={s} className="flex items-center gap-2">
                 <div
-                  className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold transition-colors ${
-                    i <= currentStep
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-secondary text-muted-foreground"
-                  }`}
+                  className={`h-7 w-7 rounded-full flex items-center justify-center text-xs font-semibold ${idx <= currentStep ? "bg-primary text-primary-foreground" : "bg-secondary text-muted-foreground"}`}
                 >
-                  {i + 1}
+                  {idx + 1}
                 </div>
-
-                <span
-                  className={`text-xs font-medium hidden sm:block ${
-                    i <= currentStep
-                      ? "text-foreground"
-                      : "text-muted-foreground"
-                  }`}
-                >
-                  {s}
-                </span>
-
-                {i < steps.length - 1 && (
-                  <div
-                    className={`flex-1 h-0.5 rounded ${
-                      i < currentStep ? "bg-primary" : "bg-border"
-                    }`}
-                  />
-                )}
+                <span className={`text-xs ${idx === currentStep ? "text-foreground" : "text-muted-foreground"}`}>{s}</span>
+                {idx < steps.length - 1 ? <div className="w-6 h-px bg-border" /> : null}
               </div>
             ))}
           </div>
 
-          {/* Step 0 */}
           {currentStep === 0 && (
-            <div className="space-y-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>Role Title</Label>
-                  <Input
-                    placeholder="e.g. SDE Intern"
-                    value={form.title}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, title: e.target.value }))
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Company</Label>
-                  <Input
-                    placeholder="e.g. Google"
-                    value={form.company}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, company: e.target.value }))
-                    }
-                  />
-                </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2 col-span-2">
+                <Label>Role Title</Label>
+                <Input value={form.title} onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))} placeholder="Frontend Intern" />
               </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>Location</Label>
-                  <Input
-                    placeholder="e.g. Bangalore / Remote"
-                    value={form.location}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, location: e.target.value }))
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Job Type</Label>
-                  <Select
-                    value={form.jobType}
-                    onValueChange={(v) =>
-                      setForm((p) => ({ ...p, jobType: v as any }))
-                    }
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select type" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="full-time">Full-time</SelectItem>
-                      <SelectItem value="intern">Internship</SelectItem>
-                      <SelectItem value="contract">Contract</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>CTC / Stipend</Label>
-                  <Input
-                    placeholder="e.g. ₹12 LPA or ₹40k/month"
-                    value={form.ctcOrStipend}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, ctcOrStipend: e.target.value }))
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Apply Link</Label>
-                  <Input
-                    placeholder="https://..."
-                    value={form.applyUrl}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, applyUrl: e.target.value }))
-                    }
-                  />
-                </div>
-              </div>
-
               <div className="space-y-2">
+                <Label>Company</Label>
+                <Input value={form.company} onChange={(e) => setForm((p) => ({ ...p, company: e.target.value }))} placeholder="ABC" />
+              </div>
+              <div className="space-y-2">
+                <Label>Location</Label>
+                <Input value={form.location} onChange={(e) => setForm((p) => ({ ...p, location: e.target.value }))} placeholder="Remote" />
+              </div>
+              <div className="space-y-2">
+                <Label>Job Type</Label>
+                <Select value={form.jobType} onValueChange={(v: any) => setForm((p) => ({ ...p, jobType: v }))}>
+                  <SelectTrigger><SelectValue placeholder="Select" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="Internship">Internship</SelectItem>
+                    <SelectItem value="Full-time">Full-time</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>CTC / Stipend</Label>
+                <Input value={form.ctcOrStipend} onChange={(e) => setForm((p) => ({ ...p, ctcOrStipend: e.target.value }))} placeholder="₹15k/month" />
+              </div>
+              <div className="space-y-2 col-span-2">
+                <Label>Apply Link</Label>
+                <Input value={form.applyUrl} onChange={(e) => setForm((p) => ({ ...p, applyUrl: e.target.value }))} placeholder="https://..." />
+              </div>
+              <div className="space-y-2 col-span-2">
                 <Label>Job Description</Label>
-                <Textarea
-                  placeholder="Describe responsibilities and requirements..."
-                  className="min-h-[120px]"
-                  value={form.jdText}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, jdText: e.target.value }))
-                  }
-                />
+                <Textarea value={form.jdText} onChange={(e) => setForm((p) => ({ ...p, jdText: e.target.value }))} rows={7} />
               </div>
             </div>
           )}
 
-          {/* Step 1 */}
           {currentStep === 1 && (
             <div className="space-y-4">
-              <div className="space-y-2">
+              <div>
                 <Label>Eligible Branches</Label>
-                <div className="flex flex-wrap gap-2">
-                  {branches.map((b) => {
-                    const checked = form.eligibleBranches.includes(b);
-                    return (
-                      <label
-                        key={b}
-                        className="flex items-center gap-2 px-3 py-1.5 border border-border rounded-lg text-sm cursor-pointer hover:bg-secondary transition-colors"
-                      >
-                        <Checkbox
-                          checked={checked}
-                          onCheckedChange={(v) => toggleBranch(b, Boolean(v))}
-                        />
-                        {b}
-                      </label>
-                    );
-                  })}
+                <div className="grid grid-cols-2 gap-2 mt-2">
+                  {branches.map((b) => (
+                    <label key={b} className="flex items-center gap-2 text-sm cursor-pointer">
+                      <Checkbox checked={form.eligibleBranches.includes(b)} onCheckedChange={(v) => toggleBranch(b, Boolean(v))} />
+                      {b}
+                    </label>
+                  ))}
                 </div>
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label>Batch / Year</Label>
-                  <Select
-                    value={form.batch}
-                    onValueChange={(v) => setForm((p) => ({ ...p, batch: v }))}
-                  >
-                    <SelectTrigger>
-                      <SelectValue placeholder="Select batch" />
-                    </SelectTrigger>
+                  <Label>Batch (optional)</Label>
+                  <Select value={form.batch} onValueChange={(v) => setForm((p) => ({ ...p, batch: v }))}>
+                    <SelectTrigger><SelectValue placeholder="Select" /></SelectTrigger>
                     <SelectContent>
                       {batches.map((b) => (
-                        <SelectItem key={b} value={b}>
-                          {b}
-                        </SelectItem>
+                        <SelectItem key={b} value={b}>{b}</SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                 </div>
-
                 <div className="space-y-2">
-                  <Label>Min CGPA</Label>
-                  <Input
-                    type="number"
-                    step="0.1"
-                    placeholder="e.g. 7.0"
-                    value={form.minCgpa}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, minCgpa: e.target.value }))
-                    }
-                  />
+                  <Label>Min CGPA (optional)</Label>
+                  <Input value={form.minCgpa} onChange={(e) => setForm((p) => ({ ...p, minCgpa: e.target.value }))} placeholder="7.0" />
+                </div>
+                <div className="space-y-2">
+                  <Label>Skills (comma-separated)</Label>
+                  <Input value={form.skillsCsv} onChange={(e) => setForm((p) => ({ ...p, skillsCsv: e.target.value }))} placeholder="React, Node, Firebase" />
+                </div>
+                <div className="space-y-2">
+                  <Label>Seat limit (optional)</Label>
+                  <Input value={form.seatLimit} onChange={(e) => setForm((p) => ({ ...p, seatLimit: e.target.value }))} placeholder="50" />
                 </div>
               </div>
 
-              <div className="space-y-2">
-                <Label>Required Skills</Label>
-                <Input
-                  placeholder="e.g. Python, SQL, React (comma separated)"
-                  value={form.skillsCsv}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, skillsCsv: e.target.value }))
-                  }
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label>Seat Limit (optional)</Label>
-                <Input
-                  type="number"
-                  placeholder="Leave blank for unlimited"
-                  value={form.seatLimit}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, seatLimit: e.target.value }))
-                  }
-                />
-              </div>
-
-              <div className="bg-secondary/50 rounded-lg p-4 border border-border">
-                <p className="text-sm text-muted-foreground">
-                  Estimated eligible students:{" "}
-                  <span className="font-semibold text-foreground">
-                    ~{estimatedEligible}
-                  </span>
-                </p>
+              <div className="bg-secondary/30 rounded-lg p-3">
+                <p className="text-xs text-muted-foreground">Estimated eligible students (demo): <span className="font-semibold text-foreground">{estimatedEligible}</span></p>
               </div>
             </div>
           )}
 
-          {/* Step 2 */}
           {currentStep === 2 && (
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <Label>Application Deadline</Label>
-                <Input
-                  type="datetime-local"
-                  value={form.deadlineLocal}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, deadlineLocal: e.target.value }))
-                  }
-                />
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2 col-span-2">
+                <Label>Deadline</Label>
+                <Input type="datetime-local" value={form.deadlineLocal} onChange={(e) => setForm((p) => ({ ...p, deadlineLocal: e.target.value }))} />
               </div>
-
               <div className="space-y-2">
-                <Label>Online Assessment Date (optional)</Label>
-                <Input
-                  type="datetime-local"
-                  value={form.oaLocal}
-                  onChange={(e) =>
-                    setForm((p) => ({ ...p, oaLocal: e.target.value }))
-                  }
-                />
+                <Label>OA Date (optional)</Label>
+                <Input type="datetime-local" value={form.oaLocal} onChange={(e) => setForm((p) => ({ ...p, oaLocal: e.target.value }))} />
               </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>Interview Start Date (optional)</Label>
-                  <Input
-                    type="date"
-                    value={form.interviewStart}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, interviewStart: e.target.value }))
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label>Interview End Date (optional)</Label>
-                  <Input
-                    type="date"
-                    value={form.interviewEnd}
-                    onChange={(e) =>
-                      setForm((p) => ({ ...p, interviewEnd: e.target.value }))
-                    }
-                  />
-                </div>
+              <div className="space-y-2">
+                <Label>Interview Start (optional)</Label>
+                <Input type="datetime-local" value={form.interviewStart} onChange={(e) => setForm((p) => ({ ...p, interviewStart: e.target.value }))} />
+              </div>
+              <div className="space-y-2">
+                <Label>Interview End (optional)</Label>
+                <Input type="datetime-local" value={form.interviewEnd} onChange={(e) => setForm((p) => ({ ...p, interviewEnd: e.target.value }))} />
               </div>
             </div>
           )}
 
-          {/* Step 3 */}
           {currentStep === 3 && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between p-4 bg-secondary/50 rounded-lg border border-border">
-                <div>
-                  <p className="text-sm font-medium text-foreground">
-                    Institute Verified
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    This drive is verified by the placement cell
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <ShieldCheck className="w-5 h-5 text-primary" />
-                  <span className="text-sm font-medium text-primary">
-                    Enabled
-                  </span>
-                </div>
+              <div className="bg-primary/5 border border-primary/10 rounded-lg p-4">
+                <p className="text-sm font-semibold text-foreground mb-1">Ready to publish</p>
+                <p className="text-xs text-muted-foreground">This will create an Institute Verified job in /jobs. Students will see it highlighted in their Candidate dashboard.</p>
               </div>
 
-              <div className="bg-card rounded-lg border border-border p-4 space-y-2">
-                <p className="text-sm font-medium text-foreground">
-                  Review Summary
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Role: {form.title || "—"} — {form.company || "—"} —{" "}
-                  {form.location || "—"}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Eligible:{" "}
-                  {form.eligibleBranches.length
-                    ? form.eligibleBranches.join(", ")
-                    : "All"}{" "}
-                  — Batch {form.batch || "—"} — Min CGPA {form.minCgpa || "—"}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Deadline:{" "}
-                  {form.deadlineLocal
-                    ? formatDate(new Date(form.deadlineLocal))
-                    : "—"}
-                </p>
+              <div className="flex flex-wrap gap-2">
+                <Badge>Institute Verified</Badge>
+                <Badge variant="secondary">Visibility: institute</Badge>
+                <Badge variant="outline">Source: tpo</Badge>
               </div>
             </div>
           )}
 
-          <div className="flex items-center justify-between pt-4 border-t border-border">
+          <div className="flex items-center justify-between mt-6">
             <Button
               variant="outline"
-              onClick={() =>
-                currentStep > 0
-                  ? setCurrentStep(currentStep - 1)
-                  : setWizardOpen(false)
-              }
-              disabled={saving}
+              size="sm"
+              onClick={() => {
+                if (currentStep === 0) {
+                  setWizardOpen(false);
+                  resetWizard();
+                } else {
+                  setCurrentStep((s) => Math.max(0, s - 1));
+                }
+              }}
             >
-              {currentStep > 0 ? "Back" : "Cancel"}
+              {currentStep === 0 ? "Cancel" : "Back"}
             </Button>
 
-            <Button onClick={nextOrPublish} disabled={saving}>
-              {saving ? (
-                <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Publishing…
-                </>
-              ) : currentStep < steps.length - 1 ? (
-                "Next"
-              ) : (
-                "Publish Drive"
-              )}
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="ghost" size="sm" onClick={resetWizard}>
+                <X className="w-4 h-4 mr-1.5" /> Reset
+              </Button>
+              <Button size="sm" onClick={nextOrPublish} disabled={saving}>
+                {saving ? (<><Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> Publishing…</>) : (currentStep < steps.length - 1 ? "Next" : "Publish")}
+              </Button>
+            </div>
           </div>
         </DialogContent>
       </Dialog>
-
-      {/* Drive Detail Slide-over */}
-      {selectedDrive && (
-        <div className="fixed inset-0 z-50 flex justify-end">
-          <div
-            className="absolute inset-0 bg-foreground/20"
-            onClick={() => setSelectedDriveId(null)}
-          />
-          <div className="relative w-full max-w-xl bg-card border-l border-border overflow-y-auto animate-slide-in-right">
-            <div className="sticky top-0 bg-card border-b border-border px-6 py-4 flex items-center justify-between z-10">
-              <div>
-                <h2 className="text-lg font-semibold text-foreground">
-                  {selectedDrive.title}
-                </h2>
-                <p className="text-sm text-muted-foreground">
-                  {selectedDrive.company}
-                </p>
-              </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setSelectedDriveId(null)}
-              >
-                <X className="w-4 h-4" />
-              </Button>
-            </div>
-
-            <div className="p-6 space-y-6">
-              <div className="flex flex-wrap gap-2">
-                <StatusBadge
-                  status={
-                    selectedDrive.status === "Closed"
-                      ? "Closed"
-                      : isDeadlineSoon(toDate(selectedDrive.deadlineAt))
-                        ? "Deadline Soon"
-                        : "Active"
-                  }
-                />
-                {selectedDrive.verified && (
-                  <StatusBadge status="Institute Verified" />
-                )}
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-secondary/50 rounded-lg p-4">
-                  <p className="text-xs text-muted-foreground">
-                    Eligible Students
-                  </p>
-                  <p className="text-xl font-bold text-foreground">
-                    {selectedDrive.stats?.eligibleEstimate ?? "—"}
-                  </p>
-                </div>
-                <div className="bg-secondary/50 rounded-lg p-4">
-                  <p className="text-xs text-muted-foreground">Applicants</p>
-                  <p className="text-xl font-bold text-foreground">
-                    {selectedDrive.stats?.applicants ?? 0}
-                  </p>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <p className="text-xs text-muted-foreground">Eligibility</p>
-                <div className="flex flex-wrap gap-1.5">
-                  {(selectedDrive.eligibility?.branches?.length
-                    ? selectedDrive.eligibility.branches
-                    : ["All Branches"]
-                  ).map((b) => (
-                    <Badge key={b} variant="secondary" className="text-xs">
-                      {b}
-                    </Badge>
-                  ))}
-                  <Badge variant="secondary" className="text-xs">
-                    Batch {selectedDrive.eligibility?.batch ?? "—"}
-                  </Badge>
-                  <Badge variant="secondary" className="text-xs">
-                    Min CGPA {selectedDrive.eligibility?.minCgpa ?? "—"}
-                  </Badge>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <p className="text-xs text-muted-foreground">Important dates</p>
-                <div className="text-sm text-foreground space-y-1">
-                  <p>
-                    <span className="text-muted-foreground">Deadline:</span>{" "}
-                    {formatDate(toDate(selectedDrive.deadlineAt))}
-                  </p>
-                  <p>
-                    <span className="text-muted-foreground">OA:</span>{" "}
-                    {formatDate(toDate(selectedDrive.oaAt ?? null))}
-                  </p>
-                  <p>
-                    <span className="text-muted-foreground">
-                      Interview window:
-                    </span>{" "}
-                    {formatDate(toDate(selectedDrive.interviewStartAt ?? null))}{" "}
-                    — {formatDate(toDate(selectedDrive.interviewEndAt ?? null))}
-                  </p>
-                </div>
-              </div>
-
-              {selectedDrive.applyUrl && (
-                <Button asChild variant="outline" className="w-full">
-                  <a
-                    href={selectedDrive.applyUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Open Apply Link
-                  </a>
-                </Button>
-              )}
-
-              <div className="space-y-1 text-xs text-muted-foreground">
-                <p>Created by: {selectedDrive.createdBy}</p>
-                <p>Institute: {selectedDrive.instituteId}</p>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
