@@ -11,13 +11,6 @@ function requireEnv(name: string) {
  * POST https://api.groq.com/openai/v1/chat/completions
  */
 
-type GroqMessage = { role: "system" | "user" | "assistant"; content: string };
-
-function requireEnv(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
-}
 
 export async function groqChatJson(args: {
   model: string;

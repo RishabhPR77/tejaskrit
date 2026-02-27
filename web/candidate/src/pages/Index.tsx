@@ -215,18 +215,7 @@ export default function Dashboard() {
           ))}
         </div>
 
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={async () => {
-            const topIds = filtered.slice(0, 12).map(j => j.id);
-            await refreshAiMatchScores(topIds);
-            qc.invalidateQueries({ queryKey: ["recommendations", authUser!.uid] });
-            qc.invalidateQueries({ queryKey: ["applications", authUser!.uid] });
-          }}
-        >
-          AI Score Top Jobs
-        </Button>
+  
 
         {/* Priority Opportunities */}
         <section>
